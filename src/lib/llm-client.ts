@@ -534,7 +534,14 @@ export async function streamChatWithReasoningRetry(
   let overrides = requestOverrides
 
   for (;;) {
-    let contentProduced = false
+    // Count characters, not callbacks. `streamChat` raises the reasoning-only
+    // diagnostic on `contentCharsEmitted === 0`, and OpenAI-compatible
+    // gateways put `content: ""` in both the role-only opening chunk and the
+    // finish_reason chunk of an otherwise ordinary stream. Treating those empty
+    // deltas as "the model answered" made the retry unreachable on exactly the
+    // endpoints it exists for — the #743 case. Keeping the same accounting as
+    // the detector guarantees the retry fires exactly when the diagnostic does.
+    let contentChars = 0
 
     // Every path in streamChat settles through onDone or onError, so resolving
     // from the callbacks — and catching a stray rejection — cannot hang.
@@ -544,7 +551,7 @@ export async function streamChatWithReasoningRetry(
         messages,
         {
           onToken: (token) => {
-            contentProduced = true
+            contentChars += token.length
             callbacks.onToken(token)
           },
           onReasoningToken: callbacks.onReasoningToken,
@@ -564,7 +571,7 @@ export async function streamChatWithReasoningRetry(
       return
     }
 
-    if (!contentProduced && isReasoningOnlyResponseError(error)) {
+    if (contentChars === 0 && isReasoningOnlyResponseError(error)) {
       const bumped = nextReasoningRetryBudget(overrides)
       if (bumped !== null) {
         overrides = { ...overrides, max_tokens: bumped }

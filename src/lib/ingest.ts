@@ -1071,7 +1071,12 @@ async function autoIngestImpl(
 
   let generation = ""
 
-  await streamChat(
+  // Same recovery as the analysis pass: a thinking endpoint that spends this
+  // budget on chain-of-thought ends the stream with no FILE blocks, which used
+  // to surface as "Generation failed" and lose the page exactly like #743's
+  // analysis failure. The retry only fires when nothing was generated, so it
+  // can never emit duplicate FILE blocks.
+  await streamChatWithReasoningRetry(
     llmConfig,
     [
       { role: "system", content: buildGenerationPrompt(schema, purpose, index, sourceIdentity, overview, sourceContext, sourceSummaryPath) },
@@ -1125,7 +1130,7 @@ async function autoIngestImpl(
   if (!signal?.aborted && shouldRunDedicatedReviewStage(generation)) {
     let reviewStageHadError = false
     try {
-      await streamChat(
+      await streamChatWithReasoningRetry(
         llmConfig,
         [
           {
@@ -1200,7 +1205,7 @@ async function autoIngestImpl(
     let repairOutput = ""
     let repairFailed = false
     try {
-      await streamChat(
+      await streamChatWithReasoningRetry(
         llmConfig,
         [
           {

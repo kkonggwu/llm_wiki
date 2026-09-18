@@ -106,6 +106,18 @@ function openAiSseReasoning(reasoning: string): string {
   return `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: reasoning } }] })}`
 }
 
+/** Opening chunk of every OpenAI-compatible stream: role only, empty content. */
+function openAiSseRoleOnly(): string {
+  return `data: ${JSON.stringify({ choices: [{ delta: { role: "assistant", content: "" } }] })}`
+}
+
+/** Closing chunk of such a stream: empty content plus finish_reason. */
+function openAiSseFinish(): string {
+  return `data: ${JSON.stringify({
+    choices: [{ delta: { content: "" }, finish_reason: "stop" }],
+  })}`
+}
+
 function sseResponse(...records: string[]): Response {
   return new Response([...records, "data: [DONE]"].join("\n\n"), {
     status: 200,
@@ -144,6 +156,63 @@ describe("streamChatWithReasoningRetry", () => {
     expect(JSON.parse(String(mockHttpFetch.mock.calls[0][1]?.body)).max_tokens).toBe(4_096)
     expect(JSON.parse(String(mockHttpFetch.mock.calls[1][1]?.body)).max_tokens).toBe(16_384)
     expect(onToken).toHaveBeenCalledWith("analysis")
+    expect(onDone).toHaveBeenCalledTimes(1)
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it("retries when the gateway brackets the stream with empty content deltas", async () => {
+    // The #743 wire shape: `content: ""` in the role-only opening chunk and
+    // again in the finish_reason chunk. Counting those empty deltas as "the
+    // model answered" kept the retry from ever firing on the endpoints this
+    // fix targets, so the CoT-only analysis was still lost.
+    mockHttpFetch
+      .mockResolvedValueOnce(sseResponse(
+        openAiSseRoleOnly(),
+        openAiSseReasoning("t".repeat(300)),
+        openAiSseFinish(),
+      ))
+      .mockResolvedValueOnce(sseResponse(openAiSseToken("analysis")))
+
+    const onToken = vi.fn()
+    const onDone = vi.fn()
+    const onError = vi.fn()
+
+    await streamChatWithReasoningRetry(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken, onDone, onError },
+      undefined,
+      { temperature: 0.1, max_tokens: 4_096 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(String(mockHttpFetch.mock.calls[1][1]?.body)).max_tokens).toBe(16_384)
+    // The answer arrives exactly once — the re-issue cannot duplicate it.
+    expect(onToken.mock.calls.filter((call) => call[0] === "analysis")).toHaveLength(1)
+    expect(onDone).toHaveBeenCalledTimes(1)
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it("does not retry an empty stream that never thought", async () => {
+    // Guards the character accounting from over-retrying: empty deltas with
+    // no reasoning are a clean (if useless) stream, not the #743 failure.
+    mockHttpFetch.mockImplementation(async () =>
+      sseResponse(openAiSseRoleOnly(), openAiSseFinish()),
+    )
+
+    const onToken = vi.fn()
+    const onDone = vi.fn()
+    const onError = vi.fn()
+
+    await streamChatWithReasoningRetry(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken, onDone, onError },
+      undefined,
+      { max_tokens: 4_096 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(1)
     expect(onDone).toHaveBeenCalledTimes(1)
     expect(onError).not.toHaveBeenCalled()
   })
