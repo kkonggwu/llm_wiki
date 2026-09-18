@@ -9,7 +9,7 @@ import {
   writeFile,
   listDirectory,
 } from "@/commands/fs"
-import { streamChat } from "@/lib/llm-client"
+import { streamChat, streamChatWithReasoningRetry } from "@/lib/llm-client"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { parseWithMineruResult } from "@/lib/mineru"
@@ -54,6 +54,8 @@ const INGEST_GENERATION_TOKENS_DEFAULT = 8_192
 const INGEST_GENERATION_TOKENS_128K = 16_384
 const INGEST_GENERATION_TOKENS_256K = 24_576
 const INGEST_GENERATION_TOKENS_512K = 32_768
+const INGEST_ANALYSIS_TOKENS_MIN = 8_192
+const INGEST_ANALYSIS_TOKENS_MAX = 16_384
 const REVIEW_STAGE_MIN_SIGNAL_CHARS = 10_000
 const REVIEW_STAGE_MIN_FILE_BLOCKS = 4
 const AGGREGATE_WIKI_PATHS = ["wiki/index.md", "wiki/overview.md", "wiki/log.md"] as const
@@ -1033,7 +1035,7 @@ async function autoIngestImpl(
   let analysis = precomputedAnalysis
 
   if (!analysis) {
-    await streamChat(
+    await streamChatWithReasoningRetry(
       llmConfig,
       [
         { role: "system", content: buildAnalysisPrompt(purpose, index, sourceContext, schema) },
@@ -1047,7 +1049,11 @@ async function autoIngestImpl(
         },
       },
       signal,
-      { temperature: 0.1, reasoning: resolveIngestReasoning(llmConfig), max_tokens: 4096 },
+      {
+        temperature: 0.1,
+        reasoning: resolveIngestReasoning(llmConfig),
+        max_tokens: computeIngestAnalysisMaxTokens(llmConfig.maxContextSize),
+      },
     )
   }
 
@@ -2588,6 +2594,24 @@ export function computeIngestReviewMaxTokens(maxContextSize: number | undefined)
   return Math.min(8_192, Math.max(4_096, Math.floor(computeIngestGenerationMaxTokens(maxContextSize) / 2)))
 }
 
+/**
+ * Output budget for the analysis pass (step 1/2) and its long-source chunk
+ * variant.
+ *
+ * Analysis is a bounded structured extraction, so half the generation
+ * allowance is the right size for the *answer* — but a thinking-capable
+ * endpoint spends part of that same budget on chain-of-thought before it
+ * writes anything. Pinning this at a flat 4096 let a reasoning model consume
+ * the entire allowance on CoT and end the stream with empty `content`, which
+ * surfaced as "Analysis failed: ... no actual response content" and silently
+ * lost the page (issue #743). Scale with the context window like generation
+ * does, with a floor that leaves room for the thinking and the answer.
+ */
+export function computeIngestAnalysisMaxTokens(maxContextSize: number | undefined): number {
+  const halfGeneration = Math.floor(computeIngestGenerationMaxTokens(maxContextSize) / 2)
+  return Math.min(INGEST_ANALYSIS_TOKENS_MAX, Math.max(INGEST_ANALYSIS_TOKENS_MIN, halfGeneration))
+}
+
 function splitOversizedBlock(block: string, targetChars: number): string[] {
   if (block.length <= targetChars * 1.25) return [block]
 
@@ -2923,7 +2947,7 @@ async function analyzeLongSourceInChunks(
 
     let raw = ""
     let hadError = false
-    await streamChat(
+    await streamChatWithReasoningRetry(
       llmConfig,
       [
         { role: "system", content: systemPrompt },
@@ -2946,7 +2970,11 @@ async function analyzeLongSourceInChunks(
         },
       },
       signal,
-      { temperature: 0.1, reasoning: resolveIngestReasoning(llmConfig), max_tokens: 4096 },
+      {
+        temperature: 0.1,
+        reasoning: resolveIngestReasoning(llmConfig),
+        max_tokens: computeIngestAnalysisMaxTokens(llmConfig.maxContextSize),
+      },
     )
 
     throwIfIngestAborted(signal, activityId)

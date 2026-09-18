@@ -9,7 +9,7 @@ vi.mock("./tauri-fetch", async () => {
   return { ...actual, getHttpFetch: () => Promise.resolve(mockHttpFetch) }
 })
 
-import { isFetchNetworkError, isReasoningOnlyResponseError, streamChat } from "./llm-client"
+import { isFetchNetworkError, isReasoningOnlyResponseError, streamChat, streamChatWithReasoningRetry } from "./llm-client"
 import type { LlmConfig } from "@/stores/wiki-store"
 
 /**
@@ -101,6 +101,123 @@ const customStreamingCfg: LlmConfig = {
 function openAiSseToken(content: string): string {
   return `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}`
 }
+
+function openAiSseReasoning(reasoning: string): string {
+  return `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: reasoning } }] })}`
+}
+
+function sseResponse(...records: string[]): Response {
+  return new Response([...records, "data: [DONE]"].join("\n\n"), {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  })
+}
+
+/**
+ * Issue #743: a reasoning-capable model on a OpenAI-compatible gateway can
+ * spend its entire output budget on chain-of-thought and end the stream with
+ * no `content`. Structured ingest calls used a fixed small budget, so the
+ * diagnostic fired and the page was lost. These pin down the recovery: one
+ * re-issue with a larger budget, and no retry when that cannot help.
+ */
+describe("streamChatWithReasoningRetry", () => {
+  beforeEach(() => mockHttpFetch.mockReset())
+
+  it("re-issues the request with a larger budget when the model only thought", async () => {
+    mockHttpFetch
+      .mockResolvedValueOnce(sseResponse(openAiSseReasoning("t".repeat(300))))
+      .mockResolvedValueOnce(sseResponse(openAiSseToken("analysis")))
+
+    const onToken = vi.fn()
+    const onDone = vi.fn()
+    const onError = vi.fn()
+
+    await streamChatWithReasoningRetry(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken, onDone, onError },
+      undefined,
+      { temperature: 0.1, max_tokens: 4_096 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(String(mockHttpFetch.mock.calls[0][1]?.body)).max_tokens).toBe(4_096)
+    expect(JSON.parse(String(mockHttpFetch.mock.calls[1][1]?.body)).max_tokens).toBe(16_384)
+    expect(onToken).toHaveBeenCalledWith("analysis")
+    expect(onDone).toHaveBeenCalledTimes(1)
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it("surfaces the diagnostic instead of retrying once the budget is at the ceiling", async () => {
+    mockHttpFetch.mockImplementation(async () => sseResponse(openAiSseReasoning("t".repeat(300))))
+
+    const onToken = vi.fn()
+    const onDone = vi.fn()
+    const onError = vi.fn()
+
+    await streamChatWithReasoningRetry(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken, onDone, onError },
+      undefined,
+      { max_tokens: 32_768 },
+    )
+
+    // Re-sending an identical request would fail identically, so the original
+    // diagnostic is the honest answer.
+    expect(mockHttpFetch).toHaveBeenCalledTimes(1)
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(isReasoningOnlyResponseError(onError.mock.calls[0][0])).toBe(true)
+    expect(onDone).not.toHaveBeenCalled()
+  })
+
+  it("passes a normal successful stream straight through", async () => {
+    mockHttpFetch.mockImplementation(async () => sseResponse(openAiSseToken("ok")))
+
+    const onToken = vi.fn()
+    const onDone = vi.fn()
+    const onError = vi.fn()
+
+    await streamChatWithReasoningRetry(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken, onDone, onError },
+      undefined,
+      { max_tokens: 4_096 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(1)
+    expect(onToken).toHaveBeenCalledWith("ok")
+    expect(onDone).toHaveBeenCalledTimes(1)
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it("does not retry unrelated endpoint errors", async () => {
+    mockHttpFetch.mockImplementation(async () => new Response(
+      JSON.stringify({ error: { code: 400, message: "request exceeds available context" } }),
+      { status: 200, headers: { "Content-Type": "text/event-stream" } },
+    ))
+
+    const onToken = vi.fn()
+    const onDone = vi.fn()
+    const onError = vi.fn()
+
+    await streamChatWithReasoningRetry(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken, onDone, onError },
+      undefined,
+      { max_tokens: 4_096 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(1)
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls[0][0].message).toBe(
+      "LLM endpoint error 400: request exceeds available context",
+    )
+    expect(onDone).not.toHaveBeenCalled()
+  })
+})
 
 describe("streamChat — buffered streaming responses", () => {
   beforeEach(() => mockHttpFetch.mockReset())

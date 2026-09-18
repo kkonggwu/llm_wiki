@@ -478,3 +478,101 @@ export async function streamChat(
     reader.releaseLock()
   }
 }
+
+/**
+ * Upper bound for the automatic reasoning-budget retry. Big enough to hold a
+ * long chain-of-thought *and* its answer on any current model; small enough
+ * that the retry still fits the per-request ceiling gateways commonly impose.
+ */
+export const REASONING_RETRY_MAX_TOKENS = 32_768
+
+/**
+ * Never retry below this. A 4x bump from a small budget can still be too tight
+ * for a model that already spent thousands of tokens thinking.
+ */
+const REASONING_RETRY_FLOOR_TOKENS = 16_384
+
+/**
+ * Output budget to try next after a reasoning-only response, or `null` when the
+ * current budget already sits at the ceiling. Returning `null` matters:
+ * re-sending an identical request would fail identically, so the caller should
+ * surface the original diagnostic instead of burning a round trip.
+ */
+function nextReasoningRetryBudget(overrides?: RequestOverrides): number | null {
+  const current = overrides?.max_tokens ?? 4_096
+  const bumped = Math.min(
+    REASONING_RETRY_MAX_TOKENS,
+    Math.max(current * 4, REASONING_RETRY_FLOOR_TOKENS),
+  )
+  return bumped > current ? bumped : null
+}
+
+/**
+ * `streamChat` with one recovery attempt for the reasoning-only failure.
+ *
+ * Structured call sites (ingest analysis, long-source chunk analysis) hand the
+ * model a fixed output budget. An endpoint that thinks before answering spends
+ * part of that same budget on chain-of-thought, and when the thinking alone
+ * fills it the stream ends on a clean stop with zero `content` — which
+ * `streamChat` reports as the "produced N characters of reasoning ... but no
+ * actual response content" diagnostic. Nothing about the request was invalid,
+ * so the fix is to give the model room to finish thinking *and* write, rather
+ * than fail the ingest and drop the page.
+ *
+ * The retry is taken only when the first attempt emitted no content at all, so
+ * a caller can never observe duplicated content. Reasoning tokens are forwarded
+ * as they arrive, so a retried attempt replays them; the structured callers
+ * this exists for do not subscribe to reasoning.
+ */
+export async function streamChatWithReasoningRetry(
+  config: LlmConfig,
+  messages: import("./llm-providers").ChatMessage[],
+  callbacks: StreamCallbacks,
+  signal?: AbortSignal,
+  requestOverrides?: RequestOverrides,
+): Promise<void> {
+  let overrides = requestOverrides
+
+  for (;;) {
+    let contentProduced = false
+
+    // Every path in streamChat settles through onDone or onError, so resolving
+    // from the callbacks — and catching a stray rejection — cannot hang.
+    const error = await new Promise<Error | undefined>((resolve) => {
+      void streamChat(
+        config,
+        messages,
+        {
+          onToken: (token) => {
+            contentProduced = true
+            callbacks.onToken(token)
+          },
+          onReasoningToken: callbacks.onReasoningToken,
+          onDone: () => resolve(undefined),
+          onError: (err) => resolve(err),
+        },
+        signal,
+        overrides,
+      ).catch((err: unknown) => {
+        resolve(err instanceof Error ? err : new Error(String(err)))
+      })
+    })
+
+    // Success and user cancellation both settle this way; neither retries.
+    if (error === undefined) {
+      callbacks.onDone()
+      return
+    }
+
+    if (!contentProduced && isReasoningOnlyResponseError(error)) {
+      const bumped = nextReasoningRetryBudget(overrides)
+      if (bumped !== null) {
+        overrides = { ...overrides, max_tokens: bumped }
+        continue
+      }
+    }
+
+    callbacks.onError(error)
+    return
+  }
+}
