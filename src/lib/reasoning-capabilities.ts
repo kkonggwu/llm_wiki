@@ -106,11 +106,16 @@ export function resolveReasoningCapabilities(config: LlmConfig): ReasoningCapabi
     if (/xiaomimimo\.com(?:[:/]|$)/.test(endpoint)) {
       return capabilities(TOGGLE_LEVELS)
     }
-    // Anthropic-compatible custom endpoints are not necessarily Anthropic
-    // itself (MiniMax, Kimi and enterprise proxies differ), so omission stays
-    // the default and no vendor-private effort levels are offered. "off" is
-    // still offered because it maps onto portable disable fields rather than
-    // onto a vendor-specific scale.
+    if ((config.apiMode ?? "chat_completions") === "anthropic_messages") {
+      // On the Anthropic wire `off` and `auto` build byte-identical bodies —
+      // thinking is only ever *enabled* explicitly — so an off control there
+      // would promise a guarantee we cannot make for a third-party gateway
+      // (it may enable thinking by default, and the Messages API has no
+      // "disable" flag). Keep it auto-only, as before.
+      return capabilities(AUTO_ONLY)
+    }
+    // OpenAI-compatible gateways: "off" maps onto portable disable fields rather
+    // than onto a vendor-specific scale, so it stays selectable.
     return capabilities(TOGGLE_LEVELS)
   }
   return capabilities(AUTO_ONLY)

@@ -791,6 +791,33 @@ describe("reasoning controls", () => {
     expect(body.temperature).toBeUndefined()
   })
 
+  it("keeps answer headroom instead of leaving extended thinking a one-token reply", () => {
+    const cfg = mkConfig({ provider: "anthropic", model: "claude-sonnet-4-5-20250929" })
+    const body = getProviderConfig(cfg).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "high" }, max_tokens: 8192 },
+    ) as Record<string, unknown>
+
+    // `max_tokens` is the total allowance (thinking + answer). The previous
+    // `budgetTokens + 1` produced max_tokens 8193 with an 8192 thinking budget,
+    // i.e. one token for the answer — and a single answer character would hide
+    // it from the reasoning-only diagnostic.
+    expect(body.max_tokens).toBe(8192)
+    expect(body.thinking).toEqual({ type: "enabled", budget_tokens: 8192 - 1024 })
+  })
+
+  it("leaves thinking off when the allowance cannot fit it plus an answer", () => {
+    const cfg = mkConfig({ provider: "anthropic", model: "claude-sonnet-4-5-20250929" })
+    const body = getProviderConfig(cfg).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "high" }, max_tokens: 512 },
+    ) as Record<string, unknown>
+
+    // Previously this inflated the caller's 512-token request to 8193.
+    expect(body.thinking).toBeUndefined()
+    expect(body.max_tokens).toBe(512)
+  })
+
   it("keeps cacheable system blocks when Anthropic extended thinking is enabled", () => {
     const cfg = mkConfig({ provider: "anthropic", model: "claude-sonnet-4-5-20250929" })
     const body = getProviderConfig(cfg).buildBody(

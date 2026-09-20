@@ -286,6 +286,146 @@ describe("streamChatWithReasoningRetry", () => {
     )
     expect(onDone).not.toHaveBeenCalled()
   })
+
+  it("makes at most one budget retry", async () => {
+    mockHttpFetch.mockImplementation(async () => sseResponse(openAiSseReasoning("t".repeat(300))))
+
+    const onError = vi.fn()
+
+    await streamChatWithReasoningRetry(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone: vi.fn(), onError },
+      undefined,
+      { max_tokens: 4_096 },
+    )
+
+    // 4096 -> 16384 once, then stop: a second bump would re-send a request that
+    // has already failed twice.
+    expect(mockHttpFetch).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(String(mockHttpFetch.mock.calls[1][1]?.body)).max_tokens).toBe(16_384)
+    expect(isReasoningOnlyResponseError(onError.mock.calls[0][0])).toBe(true)
+    expect(onError.mock.calls[0][0].message).toContain("retried with max_tokens=16384")
+  })
+
+  it("keeps the original diagnostic when the retry fails for another reason", async () => {
+    mockHttpFetch
+      .mockResolvedValueOnce(sseResponse(openAiSseReasoning("t".repeat(300))))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: "max_tokens is too large: 32768" },
+      }), { status: 400 }))
+
+    const onError = vi.fn()
+
+    await streamChatWithReasoningRetry(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone: vi.fn(), onError },
+      undefined,
+      { max_tokens: 8_192 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(2)
+    const message = String(onError.mock.calls[0][0].message)
+    // The root cause stays first so the anchored detector still recognises it,
+    // and the retry's own failure is attached instead of replacing it.
+    expect(message.startsWith("Model produced")).toBe(true)
+    expect(isReasoningOnlyResponseError(onError.mock.calls[0][0])).toBe(true)
+    expect(message).toContain("max_tokens is too large")
+  })
+
+  it("honours a caller-supplied output ceiling for the retry", async () => {
+    mockHttpFetch
+      .mockResolvedValueOnce(sseResponse(openAiSseReasoning("t".repeat(300))))
+      .mockResolvedValueOnce(sseResponse(openAiSseToken("ok")))
+
+    const onToken = vi.fn()
+
+    await streamChatWithReasoningRetry(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken, onDone: vi.fn(), onError: vi.fn() },
+      undefined,
+      { max_tokens: 4_096 },
+      { maxTokensCeiling: 8_192 },
+    )
+
+    expect(JSON.parse(String(mockHttpFetch.mock.calls[1][1]?.body)).max_tokens).toBe(8_192)
+    expect(onToken).toHaveBeenCalledWith("ok")
+  })
+
+  it("retries once when a non-streaming endpoint answers with no content", async () => {
+    const nonStreaming: LlmConfig = { ...customStreamingCfg, streamingEnabled: false }
+    mockHttpFetch
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        choices: [{ message: { content: "" } }],
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        choices: [{ message: { content: "complete answer" } }],
+      }), { status: 200 }))
+
+    const onToken = vi.fn()
+    const onError = vi.fn()
+
+    await streamChatWithReasoningRetry(
+      nonStreaming,
+      [{ role: "user", content: "hi" }],
+      { onToken, onDone: vi.fn(), onError },
+      undefined,
+      { max_tokens: 4_096 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(String(mockHttpFetch.mock.calls[1][1]?.body)).max_tokens).toBe(16_384)
+    expect(onToken).toHaveBeenCalledWith("complete answer")
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it("does not start a retry after the caller cancels", async () => {
+    const controller = new AbortController()
+    mockHttpFetch.mockImplementation(async () => {
+      controller.abort()
+      return sseResponse(openAiSseReasoning("t".repeat(300)))
+    })
+
+    const onDone = vi.fn()
+    const onError = vi.fn()
+
+    await streamChatWithReasoningRetry(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone, onError },
+      controller.signal,
+      { max_tokens: 4_096 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(1)
+    expect(onDone).toHaveBeenCalledTimes(1)
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it("releases the backstop timer when a request settles", async () => {
+    vi.useFakeTimers()
+    try {
+      mockHttpFetch.mockImplementation(async () => sseResponse(openAiSseToken("ok")))
+      const controller = new AbortController()
+      const onDone = vi.fn()
+
+      await streamChat(
+        customStreamingCfg,
+        [{ role: "user", content: "hi" }],
+        { onToken: vi.fn(), onDone, onError: vi.fn() },
+        controller.signal,
+      )
+
+      expect(onDone).toHaveBeenCalledTimes(1)
+      // Without the settle() cleanup this stays at 1 for the full 30-minute
+      // backstop window, once per attempt.
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 describe("streamChat — buffered streaming responses", () => {
@@ -383,6 +523,37 @@ describe("streamChat — buffered streaming responses", () => {
     expect(retryBody.temperature).toBe(0.1)
     expect(onToken).toHaveBeenCalledWith("ok")
     expect(onDone).toHaveBeenCalledTimes(1)
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it("also falls back when the config, not an override, asked for off", async () => {
+    // Callers such as lint, deep research and enrich-wikilinks pass no reasoning
+    // override, so their effective mode comes from the config. The fallback must
+    // fire for them too, which is why the guard asks the body builder's own
+    // predicate instead of re-reading `requestOverrides`.
+    const configOff: LlmConfig = { ...customStreamingCfg, reasoning: { mode: "off" } }
+    mockHttpFetch
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: "Extra inputs are not permitted: chat_template_kwargs" },
+      }), { status: 400 }))
+      .mockResolvedValueOnce(sseResponse(openAiSseToken("ok")))
+
+    const onToken = vi.fn()
+    const onError = vi.fn()
+
+    await streamChat(configOff, [{ role: "user", content: "hi" }], {
+      onToken,
+      onDone: vi.fn(),
+      onError,
+    })
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(String(mockHttpFetch.mock.calls[0][1]?.body)).chat_template_kwargs)
+      .toEqual({ enable_thinking: false })
+    const retryBody = JSON.parse(String(mockHttpFetch.mock.calls[1][1]?.body))
+    expect(retryBody.chat_template_kwargs).toBeUndefined()
+    expect(retryBody.reasoning_effort).toBeUndefined()
+    expect(onToken).toHaveBeenCalledWith("ok")
     expect(onError).not.toHaveBeenCalled()
   })
 

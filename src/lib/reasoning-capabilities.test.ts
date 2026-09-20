@@ -26,6 +26,13 @@ describe("reasoning capabilities", () => {
       .toEqual({ mode: "auto" })
   })
 
+  it("keeps Anthropic-wire custom gateways auto-only, where off is unrepresentable", () => {
+    // The Anthropic builder emits byte-identical bodies for auto and off, so an
+    // off control there would promise a guarantee the wire cannot make.
+    const cfg = { ...config("custom", "any-model"), apiMode: "anthropic_messages" as const }
+    expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto"])
+  })
+
   it("offers OpenRouter's documented reasoning controls only on its endpoint", () => {
     const cfg = {
       ...config("custom", "vendor/reasoning-model"),

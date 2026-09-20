@@ -1,6 +1,10 @@
 import type { LlmConfig } from "@/stores/wiki-store"
 import { isAzureOpenAiEndpoint } from "@/lib/azure-openai"
-import { getProviderConfig, type RequestOverrides } from "./llm-providers"
+import {
+  appliesPortableReasoningDisable,
+  getProviderConfig,
+  type RequestOverrides,
+} from "./llm-providers"
 import { getHttpFetch, isFetchNetworkError } from "./tauri-fetch"
 import { countReasoningCharsInLine, extractReasoningTextFromLine } from "./reasoning-detector"
 
@@ -168,16 +172,17 @@ function shouldRetryWithoutTemperature(
  * ingest still runs instead of failing outright.
  */
 const REASONING_DISABLE_FIELD_HINTS = [
+  // The field names themselves are the most reliable signal.
   "chat_template_kwargs",
   "enable_thinking",
   "reasoning_effort",
-  "extra fields",
+  // Gateways that reject unknown keys without naming them. Deliberately narrow:
+  // generic phrases like "not permitted" also appear on unrelated schema errors,
+  // where re-issuing would only burn a request.
   "extra inputs",
   "extra_forbidden",
-  "unknown field",
   "unexpected keyword",
-  "additional propert",
-  "not permitted",
+  "unknown field",
 ]
 
 function shouldRetryWithoutReasoningFields(
@@ -186,9 +191,13 @@ function shouldRetryWithoutReasoningFields(
   errorDetail: string,
   requestOverrides?: RequestOverrides,
 ): boolean {
-  if (config.provider !== "custom") return false
-  if (requestOverrides?.reasoning?.mode !== "off") return false
   if (status !== 400 && status !== 422) return false
+  // Ask the body builder's own predicate whether *this* request carried the
+  // fields. Re-deriving it from `requestOverrides` was wrong: the effective
+  // reasoning can come from the config (chat reasoning), which is how callers
+  // that pass no reasoning override — lint, deep research, enrich-wikilinks —
+  // ended up sending the fields with no fallback behind them.
+  if (!appliesPortableReasoningDisable(config, requestOverrides)) return false
   const detail = errorDetail.toLowerCase()
   return REASONING_DISABLE_FIELD_HINTS.some((hint) => detail.includes(hint))
 }
@@ -208,7 +217,31 @@ export async function streamChat(
    */
   requestOverrides?: RequestOverrides,
 ): Promise<void> {
-  const { onToken, onDone, onError } = callbacks
+  const { onToken } = callbacks
+
+  // Release the backstop timer and the user-abort listener when this attempt
+  // settles. Every path below settles through onDone/onError, and callers now
+  // retry (reasoning-only, temperature, budget), so leaving them attached kept
+  // a 30-minute timer plus a listener on the caller's long-lived signal alive
+  // for every attempt.
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+  let detachUserAbort: (() => void) | undefined
+  const settle = () => {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId)
+      timeoutId = undefined
+    }
+    detachUserAbort?.()
+    detachUserAbort = undefined
+  }
+  const onDone = () => {
+    settle()
+    callbacks.onDone()
+  }
+  const onError = (error: Error) => {
+    settle()
+    callbacks.onError(error)
+  }
 
   // Claude Code CLI uses a subprocess transport (stdin/stdout), not
   // HTTP. Dispatch before getProviderConfig — that function throws for
@@ -249,16 +282,17 @@ export async function streamChat(
 
   if (typeof AbortSignal.timeout === "function") {
     timeoutController = new AbortController()
-    const timeoutId = setTimeout(() => {
+    timeoutId = setTimeout(() => {
       timeoutFired = true
       timeoutController?.abort()
     }, timeoutMs)
 
     if (signal) {
-      signal.addEventListener("abort", () => {
-        clearTimeout(timeoutId)
+      const onUserAbort = () => {
         timeoutController?.abort()
-      })
+      }
+      signal.addEventListener("abort", onUserAbort)
+      detachUserAbort = () => signal.removeEventListener("abort", onUserAbort)
     }
     combinedSignal = timeoutController.signal
   }
@@ -314,6 +348,9 @@ export async function streamChat(
     }
     if (shouldRetryWithoutTemperature(config, response.status, errorDetail, requestOverrides)) {
       const { temperature: _temperature, ...retryOverrides } = requestOverrides ?? {}
+      // Hand the backstop to the re-issued request instead of leaving this
+      // attempt's timer attached.
+      settle()
       return streamChat(config, messages, callbacks, signal, retryOverrides)
     }
     if (shouldRetryWithoutReasoningFields(config, response.status, errorDetail, requestOverrides)) {
@@ -321,6 +358,7 @@ export async function streamChat(
       // left on: the user asked for off, but a working ingest with thinking
       // beats a hard failure, and the reasoning-only retry still covers a
       // runaway chain-of-thought.
+      settle()
       return streamChat(config, messages, callbacks, signal, {
         ...(requestOverrides ?? {}),
         reasoning: { mode: "auto" },
@@ -535,36 +573,79 @@ export const REASONING_RETRY_MAX_TOKENS = 32_768
 const REASONING_RETRY_FLOOR_TOKENS = 16_384
 
 /**
- * Output budget to try next after a reasoning-only response, or `null` when the
- * current budget already sits at the ceiling. Returning `null` matters:
- * re-sending an identical request would fail identically, so the caller should
- * surface the original diagnostic instead of burning a round trip.
+ * Empty (non-streaming) responses are the same failure the reasoning-only
+ * diagnostic describes: on a non-streaming wire the endpoint collapses to a
+ * bare `content: ""`, so a thinking model that never answered looks identical
+ * to a broken endpoint. Retrying it once with a larger budget is the
+ * non-streaming equivalent of the reasoning-only retry.
  */
-function nextReasoningRetryBudget(overrides?: RequestOverrides): number | null {
-  const current = overrides?.max_tokens ?? 4_096
-  const bumped = Math.min(
-    REASONING_RETRY_MAX_TOKENS,
-    Math.max(current * 4, REASONING_RETRY_FLOOR_TOKENS),
-  )
-  return bumped > current ? bumped : null
+export function isEmptyNonStreamingResponseError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return message === "Model returned an empty non-streaming response"
 }
 
 /**
- * `streamChat` with one recovery attempt for the reasoning-only failure.
+ * Both shapes that mean "the model produced no answer at all".
+ */
+function isRetryableEmptyAnswerError(error: Error): boolean {
+  return isReasoningOnlyResponseError(error) || isEmptyNonStreamingResponseError(error)
+}
+
+/**
+ * Report the first failure as the root cause and keep the retry's own error
+ * attached. Without this, a retry that fails for a different reason (a gateway
+ * capping `max_tokens`, say) replaced the diagnostic the user actually needs —
+ * and the message must keep matching `isReasoningOnlyResponseError`, which is
+ * prefix-anchored.
+ */
+function describeRetryFailure(first: Error, retriedBudget: number | undefined, retry: Error): Error {
+  return new Error(`${first.message} (retried with max_tokens=${retriedBudget}: ${retry.message})`)
+}
+
+/**
+ * Output budget to try next after an empty answer, or `null` when the current
+ * budget already sits at the ceiling. Returning `null` matters: re-sending an
+ * identical request would fail identically, so the caller should surface the
+ * original diagnostic instead of burning a round trip.
+ */
+function nextReasoningRetryBudget(
+  overrides?: RequestOverrides,
+  ceiling = REASONING_RETRY_MAX_TOKENS,
+): number | null {
+  const current = overrides?.max_tokens ?? 4_096
+  const bumped = Math.min(ceiling, Math.max(current * 4, REASONING_RETRY_FLOOR_TOKENS))
+  return bumped > current ? bumped : null
+}
+
+export interface ReasoningRetryOptions {
+  /**
+   * Upper bound for the retried output budget, defaulting to
+   * `REASONING_RETRY_MAX_TOKENS`. Callers that know the endpoint's real output
+   * ceiling should pass it: re-issuing above that ceiling only replaces the
+   * diagnostic with an HTTP 400.
+   */
+  maxTokensCeiling?: number
+}
+
+/**
+ * `streamChat` with at most **one** recovery attempt when an endpoint produces
+ * no answer at all (reasoning-only stream, or an empty non-streaming response).
  *
- * Structured call sites (ingest analysis, long-source chunk analysis) hand the
- * model a fixed output budget. An endpoint that thinks before answering spends
- * part of that same budget on chain-of-thought, and when the thinking alone
- * fills it the stream ends on a clean stop with zero `content` — which
- * `streamChat` reports as the "produced N characters of reasoning ... but no
- * actual response content" diagnostic. Nothing about the request was invalid,
- * so the fix is to give the model room to finish thinking *and* write, rather
- * than fail the ingest and drop the page.
+ * Structured call sites (ingest analysis, generation, long-source chunk
+ * analysis) hand the model a fixed output budget. An endpoint that thinks
+ * before answering spends part of that same budget on chain-of-thought, and
+ * when the thinking alone fills it the stream ends on a clean stop with zero
+ * `content` — which `streamChat` reports as the "produced N characters of
+ * reasoning ... but no actual response content" diagnostic. Nothing about the
+ * request was invalid, so the fix is to give the model room to finish thinking
+ * *and* write, rather than fail the ingest and drop the page.
  *
- * The retry is taken only when the first attempt emitted no content at all, so
- * a caller can never observe duplicated content. Reasoning tokens are forwarded
- * as they arrive, so a retried attempt replays them; the structured callers
- * this exists for do not subscribe to reasoning.
+ * Exactly one extra attempt is made (a single budget bump), so the request
+ * amplification stays bounded even combined with `streamChat`'s own 400
+ * fallbacks. The retry is taken only when the first attempt emitted no content
+ * at all, so a caller can never observe duplicated content. Reasoning tokens
+ * are forwarded as they arrive, so a retried attempt replays them; the
+ * structured callers this exists for do not subscribe to reasoning.
  */
 export async function streamChatWithReasoningRetry(
   config: LlmConfig,
@@ -572,8 +653,11 @@ export async function streamChatWithReasoningRetry(
   callbacks: StreamCallbacks,
   signal?: AbortSignal,
   requestOverrides?: RequestOverrides,
+  options?: ReasoningRetryOptions,
 ): Promise<void> {
   let overrides = requestOverrides
+  let firstFailure: Error | undefined
+  let retriedBudget: number | undefined
 
   for (;;) {
     // Count characters, not callbacks. `streamChat` raises the reasoning-only
@@ -613,9 +697,24 @@ export async function streamChatWithReasoningRetry(
       return
     }
 
-    if (contentChars === 0 && isReasoningOnlyResponseError(error)) {
-      const bumped = nextReasoningRetryBudget(overrides)
+    // The single extra attempt already happened: report the original diagnostic
+    // as the root cause, with whatever the retry hit attached to it.
+    if (firstFailure !== undefined) {
+      callbacks.onError(describeRetryFailure(firstFailure, retriedBudget, error))
+      return
+    }
+
+    if (contentChars === 0 && isRetryableEmptyAnswerError(error)) {
+      const bumped = nextReasoningRetryBudget(overrides, options?.maxTokensCeiling)
       if (bumped !== null) {
+        // A cancel that lands between the diagnostic and the re-issue must win,
+        // otherwise we start an attempt that is already aborted.
+        if (signal?.aborted) {
+          callbacks.onDone()
+          return
+        }
+        firstFailure = error
+        retriedBudget = bumped
         overrides = { ...overrides, max_tokens: bumped }
         continue
       }

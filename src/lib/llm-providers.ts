@@ -348,6 +348,23 @@ function effectiveReasoning(config: LlmConfig, overrides?: RequestOverrides): Re
   )
 }
 
+/**
+ * Single source of truth for "does this exact request carry the generic
+ * stop-thinking fields". `buildOpenAiCompatibleBody` writes them, and
+ * `llm-client`'s 400 fallback decides whether a rejection could have been
+ * caused by them — reading the same predicate means the two cannot disagree.
+ * Note the wire check: the Anthropic-wire builder never adds these fields, so a
+ * 400 there must not trigger the fallback.
+ */
+export function appliesPortableReasoningDisable(
+  config: LlmConfig,
+  overrides?: RequestOverrides,
+): boolean {
+  if (config.provider !== "custom") return false
+  if ((config.apiMode ?? "chat_completions") !== "chat_completions") return false
+  return effectiveReasoning(config, overrides).mode === "off"
+}
+
 function isDeepSeekEndpoint(config: LlmConfig): boolean {
   return /api\.deepseek\.(?:com|cn)(?:[:/]|$)/i.test(config.customEndpoint)
 }
@@ -519,7 +536,7 @@ function buildOpenAiCompatibleBody(
     return body
   }
 
-  if (config.provider === "custom" && reasoning.mode === "off") {
+  if (appliesPortableReasoningDisable(config, overrides)) {
     // Portable "stop thinking" hints for a generic OpenAI-compatible gateway.
     // `chat_template_kwargs` is what vLLM / SGLang / llama.cpp (--jinja) hand to
     // the model's chat template; `reasoning_effort: "none"` is the OpenAI-style
@@ -599,6 +616,16 @@ function buildAnthropicSystem(systemText: string): unknown[] | undefined {
   ]
 }
 
+/**
+ * Anthropic's floor for `thinking.budget_tokens`.
+ */
+const ANTHROPIC_MIN_THINKING_TOKENS = 1024
+/**
+ * Room kept for the answer when an extended-thinking budget would otherwise
+ * consume the caller's whole `max_tokens` allowance.
+ */
+const ANTHROPIC_ANSWER_RESERVE_TOKENS = 1024
+
 function buildAnthropicBody(
   messages: ChatMessage[],
   overrides?: RequestOverrides,
@@ -662,10 +689,23 @@ function buildAnthropicBodyWithReasoning(
         : reasoning.mode === "medium"
           ? 4096
         : 8192
-  const budgetTokens = Math.max(1024, budget)
-  if ((body.max_tokens as number) <= budgetTokens) {
-    body.max_tokens = budgetTokens + 1
-  }
+  const total = body.max_tokens as number
+
+  // Thinking and the answer share `max_tokens`. The API only demands
+  // max_tokens > budget_tokens, and the old `budgetTokens + 1` satisfied that
+  // while leaving the answer a single token: thinking then consumed the whole
+  // allowance and the reply came back effectively empty — the same failure shape
+  // as #743, and one that a single answer character would hide from the
+  // reasoning-only diagnostic. Keep the caller's total allowance and clamp the
+  // thinking budget so the answer keeps real room instead. If the allowance
+  // cannot fit the API's minimum thinking budget plus an answer, thinking is
+  // left off rather than silently inflating the caller's max_tokens 16x.
+  if (total <= ANTHROPIC_MIN_THINKING_TOKENS) return body
+  const answerReserve = Math.min(ANTHROPIC_ANSWER_RESERVE_TOKENS, Math.floor(total / 2))
+  const budgetTokens = Math.max(
+    ANTHROPIC_MIN_THINKING_TOKENS,
+    Math.min(Math.max(ANTHROPIC_MIN_THINKING_TOKENS, budget), total - answerReserve),
+  )
   body.thinking = { type: "enabled", budget_tokens: budgetTokens }
   delete body.temperature
   delete body.top_p
