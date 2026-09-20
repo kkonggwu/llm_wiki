@@ -350,6 +350,42 @@ describe("streamChat — buffered streaming responses", () => {
     expect(onError).not.toHaveBeenCalled()
   })
 
+  it("drops stop-thinking fields a custom gateway rejects and retries with thinking on", async () => {
+    mockHttpFetch
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: "Unrecognized request argument supplied: chat_template_kwargs" },
+      }), { status: 400 }))
+      .mockResolvedValueOnce(new Response([
+        openAiSseToken("ok"),
+        "data: [DONE]",
+      ].join("\n\n"), { status: 200 }))
+    const onToken = vi.fn()
+    const onDone = vi.fn()
+    const onError = vi.fn()
+
+    await streamChat(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken, onDone, onError },
+      undefined,
+      { reasoning: { mode: "off" }, temperature: 0.1, max_tokens: 4_096 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(2)
+    const firstBody = JSON.parse(String(mockHttpFetch.mock.calls[0][1]?.body))
+    expect(firstBody.chat_template_kwargs).toEqual({ enable_thinking: false })
+    expect(firstBody.reasoning_effort).toBe("none")
+    // The re-issue keeps the sampling knobs but leaves thinking enabled, so a
+    // gateway that cannot express "off" still completes the ingest.
+    const retryBody = JSON.parse(String(mockHttpFetch.mock.calls[1][1]?.body))
+    expect(retryBody.chat_template_kwargs).toBeUndefined()
+    expect(retryBody.reasoning_effort).toBeUndefined()
+    expect(retryBody.temperature).toBe(0.1)
+    expect(onToken).toHaveBeenCalledWith("ok")
+    expect(onDone).toHaveBeenCalledTimes(1)
+    expect(onError).not.toHaveBeenCalled()
+  })
+
   it("cancels a still-open response body after an SSE endpoint error", async () => {
     let bodyCancelled = false
     const body = new ReadableStream<Uint8Array>({

@@ -65,9 +65,15 @@ export function isOpenRouterEndpoint(endpoint: string): boolean {
 
 /**
  * Resolve only capabilities that are part of the selected wire contract.
- * Generic custom gateways deliberately stay Auto-only: a vendor-looking
- * model name does not prove that an aggregator accepts that vendor's private
- * request fields.
+ *
+ * Generic custom gateways expose `auto` and `off` only. A vendor-looking model
+ * name still does not prove that an aggregator accepts that vendor's private
+ * *effort* scale (low/medium/high/custom), so those stay unrepresentable. But
+ * "stop thinking" is a user intent, not a vendor feature: v0.6.7 dropped it
+ * (`401bf26`) and left a thinking model behind a generic gateway with no way to
+ * be stopped, so its whole output budget could go to chain-of-thought
+ * (issue #743). The body builder maps `off` onto portable disable fields and
+ * llm-client retries without them if the gateway rejects them.
  */
 export function resolveReasoningCapabilities(config: LlmConfig): ReasoningCapabilities {
   if (config.provider === "claude-code" || config.provider === "codex-cli") {
@@ -101,10 +107,11 @@ export function resolveReasoningCapabilities(config: LlmConfig): ReasoningCapabi
       return capabilities(TOGGLE_LEVELS)
     }
     // Anthropic-compatible custom endpoints are not necessarily Anthropic
-    // itself (MiniMax, Kimi and enterprise proxies differ), so omission is the
-    // only portable default. Users can select a first-party preset when they
-    // need vendor-specific controls.
-    return capabilities(AUTO_ONLY)
+    // itself (MiniMax, Kimi and enterprise proxies differ), so omission stays
+    // the default and no vendor-private effort levels are offered. "off" is
+    // still offered because it maps onto portable disable fields rather than
+    // onto a vendor-specific scale.
+    return capabilities(TOGGLE_LEVELS)
   }
   return capabilities(AUTO_ONLY)
 }

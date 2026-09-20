@@ -174,10 +174,11 @@ describe("ingest recovers from a reasoning-only analysis (#743)", () => {
     expect(requestBodies).toHaveLength(3)
     expect(JSON.parse(requestBodies[0]).max_tokens).toBe(8_192)
     expect(JSON.parse(requestBodies[1]).max_tokens).toBe(32_768)
-    // A generic OpenAI-compatible endpoint gets no reasoning parameter at all,
-    // so `ingestReasoning` cannot stop the model from thinking there — the
-    // output budget and this retry are the only levers that exist. That is why
-    // the empty-delta guard in the wrapper mattered so much.
+    // `ingestReasoning: { mode: "high" }` is not representable on a generic
+    // custom gateway, so it normalizes to `auto`: no reasoning parameter is
+    // sent at all and the model thinks freely. That is exactly the #743 setup,
+    // and why the empty-delta guard in the wrapper mattered so much. (Selecting
+    // `off` now also works on these gateways — see the provider/retry tests.)
     expect(JSON.parse(requestBodies[1]).thinking).toBeUndefined()
     expect(JSON.parse(requestBodies[1]).reasoning_effort).toBeUndefined()
 

@@ -519,6 +519,20 @@ function buildOpenAiCompatibleBody(
     return body
   }
 
+  if (config.provider === "custom" && reasoning.mode === "off") {
+    // Portable "stop thinking" hints for a generic OpenAI-compatible gateway.
+    // `chat_template_kwargs` is what vLLM / SGLang / llama.cpp (--jinja) hand to
+    // the model's chat template; `reasoning_effort: "none"` is the OpenAI-style
+    // knob the Ollama path above already uses. This is the behaviour v0.6.7
+    // removed (401bf26): without it a thinking model behind a generic gateway
+    // cannot be stopped, and its chain-of-thought can consume the whole output
+    // budget (issue #743). Gateways that reject either field are handled by the
+    // retry-without-reasoning fallback in llm-client, so this cannot turn into
+    // a hard failure.
+    body.chat_template_kwargs = { enable_thinking: false }
+    body.reasoning_effort = "none"
+  }
+
   if (config.provider === "openai" && reasoning.mode !== "auto" && reasoning.mode !== "off") {
     if (reasoning.mode === "low" || reasoning.mode === "medium" || reasoning.mode === "high") {
       body.reasoning_effort = reasoning.mode

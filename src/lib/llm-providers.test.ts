@@ -744,19 +744,24 @@ describe("reasoning controls", () => {
     expect(body.messages).toEqual([{ role: "user", content: "Hi" }])
   })
 
-  it("does not infer Qwen private parameters on generic custom endpoints", () => {
+  it("does not infer Qwen private parameters from a model name alone", () => {
     const cfg = mkConfig({
       provider: "custom",
       model: "Qwen3.5-122B",
       customEndpoint: "http://127.0.0.1:8000/v1",
       apiMode: "chat_completions",
     })
+    // `auto` leaves the gateway alone: a vendor-looking model name does not
+    // prove the endpoint accepts chat_template_kwargs. Only an explicit `off`
+    // opts into the portable disable fields, and a gateway that then rejects
+    // them is handled by the retry-without-reasoning fallback in llm-client.
     const body = getProviderConfig(cfg).buildBody(
       [{ role: "user", content: "hi" }],
-      { reasoning: { mode: "off" } },
+      { reasoning: { mode: "auto" } },
     ) as Record<string, unknown>
 
     expect(body.chat_template_kwargs).toBeUndefined()
+    expect(body.reasoning_effort).toBeUndefined()
   })
 
   it("strips temperature for Kimi/Moonshot OpenAI-compatible endpoints", () => {
@@ -908,6 +913,38 @@ describe("reasoning controls", () => {
       { reasoning: { mode: "auto" } },
     ) as Record<string, unknown>
 
+    expect(body.reasoning_effort).toBeUndefined()
+  })
+
+  it("stops thinking on a generic custom gateway when reasoning is off", () => {
+    // v0.6.7 (401bf26) removed this mapping from the custom path, leaving a
+    // thinking model behind a gateway with no way to be stopped (#743).
+    const cfg = mkConfig({
+      provider: "custom",
+      model: "Qwen3-32B",
+      customEndpoint: "https://gateway.example/v1",
+    })
+    const body = getProviderConfig(cfg).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "off" }, temperature: 0.1, max_tokens: 4096 },
+    ) as Record<string, unknown>
+
+    expect(body.chat_template_kwargs).toEqual({ enable_thinking: false })
+    expect(body.reasoning_effort).toBe("none")
+  })
+
+  it("sends no stop-thinking fields to a custom gateway when reasoning is auto", () => {
+    const cfg = mkConfig({
+      provider: "custom",
+      model: "Qwen3-32B",
+      customEndpoint: "https://gateway.example/v1",
+    })
+    const body = getProviderConfig(cfg).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "auto" } },
+    ) as Record<string, unknown>
+
+    expect(body.chat_template_kwargs).toBeUndefined()
     expect(body.reasoning_effort).toBeUndefined()
   })
 })

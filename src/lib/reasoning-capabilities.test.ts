@@ -14,10 +14,16 @@ function config(provider: LlmConfig["provider"], model: string): LlmConfig {
 }
 
 describe("reasoning capabilities", () => {
-  it("does not infer vendor-private controls from a custom gateway model name", () => {
+  it("offers off on a custom gateway so a thinking model can actually be stopped", () => {
     const cfg = config("custom", "Qwen3-thinking-only")
-    expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto"])
-    expect(normalizeReasoningForProvider(cfg, { mode: "off" })).toEqual({ mode: "auto" })
+    // v0.6.7 (401bf26) made generic gateways Auto-only, which left a thinking
+    // model behind a gateway with no way to be stopped — the #743 failure mode.
+    expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto", "off"])
+    expect(normalizeReasoningForProvider(cfg, { mode: "off" })).toEqual({ mode: "off" })
+    // Effort levels are still not inferred from a vendor-looking model name.
+    expect(normalizeReasoningForProvider(cfg, { mode: "high" })).toEqual({ mode: "auto" })
+    expect(normalizeReasoningForProvider(cfg, { mode: "custom", budgetTokens: 2048 }))
+      .toEqual({ mode: "auto" })
   })
 
   it("offers OpenRouter's documented reasoning controls only on its endpoint", () => {

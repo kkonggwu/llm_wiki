@@ -161,6 +161,38 @@ function shouldRetryWithoutTemperature(
   )
 }
 
+/**
+ * Field names the provider layer adds when a generic custom gateway is asked to
+ * stop thinking (`reasoning: { mode: "off" }`). A gateway that does not know
+ * them answers 400/422; we then re-issue the request with thinking left on so an
+ * ingest still runs instead of failing outright.
+ */
+const REASONING_DISABLE_FIELD_HINTS = [
+  "chat_template_kwargs",
+  "enable_thinking",
+  "reasoning_effort",
+  "extra fields",
+  "extra inputs",
+  "extra_forbidden",
+  "unknown field",
+  "unexpected keyword",
+  "additional propert",
+  "not permitted",
+]
+
+function shouldRetryWithoutReasoningFields(
+  config: LlmConfig,
+  status: number,
+  errorDetail: string,
+  requestOverrides?: RequestOverrides,
+): boolean {
+  if (config.provider !== "custom") return false
+  if (requestOverrides?.reasoning?.mode !== "off") return false
+  if (status !== 400 && status !== 422) return false
+  const detail = errorDetail.toLowerCase()
+  return REASONING_DISABLE_FIELD_HINTS.some((hint) => detail.includes(hint))
+}
+
 export async function streamChat(
   config: LlmConfig,
   messages: import("./llm-providers").ChatMessage[],
@@ -283,6 +315,16 @@ export async function streamChat(
     if (shouldRetryWithoutTemperature(config, response.status, errorDetail, requestOverrides)) {
       const { temperature: _temperature, ...retryOverrides } = requestOverrides ?? {}
       return streamChat(config, messages, callbacks, signal, retryOverrides)
+    }
+    if (shouldRetryWithoutReasoningFields(config, response.status, errorDetail, requestOverrides)) {
+      // The gateway rejected the "stop thinking" fields. Re-issue with thinking
+      // left on: the user asked for off, but a working ingest with thinking
+      // beats a hard failure, and the reasoning-only retry still covers a
+      // runaway chain-of-thought.
+      return streamChat(config, messages, callbacks, signal, {
+        ...(requestOverrides ?? {}),
+        reasoning: { mode: "auto" },
+      })
     }
     if (
       response.status === 404 &&
