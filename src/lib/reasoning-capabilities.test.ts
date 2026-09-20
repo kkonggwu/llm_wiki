@@ -14,10 +14,20 @@ function config(provider: LlmConfig["provider"], model: string): LlmConfig {
 }
 
 describe("reasoning capabilities", () => {
-  it("offers off on a custom gateway so a thinking model can actually be stopped", () => {
+  it("stays auto-only until the user picks a stop-thinking method", () => {
     const cfg = config("custom", "Qwen3-thinking-only")
-    // v0.6.7 (401bf26) made generic gateways Auto-only, which left a thinking
-    // model behind a gateway with no way to be stopped — the #743 failure mode.
+    // With no method configured we would send no field at all, so an `off`
+    // control would be a promise the wire cannot keep. This is also exactly the
+    // pre-existing behaviour, so untouched configs are unchanged.
+    expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto"])
+    expect(normalizeReasoningForProvider(cfg, { mode: "off" })).toEqual({ mode: "auto" })
+  })
+
+  it("offers off once a stop-thinking method is configured", () => {
+    const cfg = {
+      ...config("custom", "Qwen3-thinking-only"),
+      reasoningDisable: "chat_template_kwargs" as const,
+    }
     expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto", "off"])
     expect(normalizeReasoningForProvider(cfg, { mode: "off" })).toEqual({ mode: "off" })
     // Effort levels are still not inferred from a vendor-looking model name.

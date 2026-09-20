@@ -114,8 +114,11 @@ export function resolveReasoningCapabilities(config: LlmConfig): ReasoningCapabi
       // "disable" flag). Keep it auto-only, as before.
       return capabilities(AUTO_ONLY)
     }
-    // OpenAI-compatible gateways: "off" maps onto portable disable fields rather
-    // than onto a vendor-specific scale, so it stays selectable.
+    // "off" is only offerable once the user has said *how* to express it. With
+    // no strategy we would send no field at all, so an off control would be a
+    // promise the wire cannot keep; `none` therefore stays auto-only, which is
+    // also exactly the behaviour of every earlier version.
+    if ((config.reasoningDisable ?? "none") === "none") return capabilities(AUTO_ONLY)
     return capabilities(TOGGLE_LEVELS)
   }
   return capabilities(AUTO_ONLY)

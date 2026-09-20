@@ -490,23 +490,25 @@ describe("streamChat — buffered streaming responses", () => {
     expect(onError).not.toHaveBeenCalled()
   })
 
-  it("drops stop-thinking fields a custom gateway rejects and retries with thinking on", async () => {
+  it("drops the rejected stop-thinking field and retries with thinking on", async () => {
+    const configWithMethod: LlmConfig = {
+      ...customStreamingCfg,
+      reasoningDisable: "chat_template_kwargs",
+    }
     mockHttpFetch
       .mockResolvedValueOnce(new Response(JSON.stringify({
         error: { message: "Unrecognized request argument supplied: chat_template_kwargs" },
       }), { status: 400 }))
-      .mockResolvedValueOnce(new Response([
-        openAiSseToken("ok"),
-        "data: [DONE]",
-      ].join("\n\n"), { status: 200 }))
+      .mockResolvedValueOnce(sseResponse(openAiSseToken("ok")))
     const onToken = vi.fn()
     const onDone = vi.fn()
     const onError = vi.fn()
+    const onNotice = vi.fn()
 
     await streamChat(
-      customStreamingCfg,
+      configWithMethod,
       [{ role: "user", content: "hi" }],
-      { onToken, onDone, onError },
+      { onToken, onDone, onError, onNotice },
       undefined,
       { reasoning: { mode: "off" }, temperature: 0.1, max_tokens: 4_096 },
     )
@@ -514,16 +516,42 @@ describe("streamChat — buffered streaming responses", () => {
     expect(mockHttpFetch).toHaveBeenCalledTimes(2)
     const firstBody = JSON.parse(String(mockHttpFetch.mock.calls[0][1]?.body))
     expect(firstBody.chat_template_kwargs).toEqual({ enable_thinking: false })
-    expect(firstBody.reasoning_effort).toBe("none")
+    // Only the selected method is sent: a second guess would make a gateway that
+    // rejects one field reject both.
+    expect(firstBody.reasoning_effort).toBeUndefined()
     // The re-issue keeps the sampling knobs but leaves thinking enabled, so a
     // gateway that cannot express "off" still completes the ingest.
     const retryBody = JSON.parse(String(mockHttpFetch.mock.calls[1][1]?.body))
     expect(retryBody.chat_template_kwargs).toBeUndefined()
-    expect(retryBody.reasoning_effort).toBeUndefined()
     expect(retryBody.temperature).toBe(0.1)
+    // ...and the downgrade of an explicit user choice is reported, not silent.
+    expect(onNotice).toHaveBeenCalledTimes(1)
+    expect(String(onNotice.mock.calls[0][0])).toContain("chat_template_kwargs")
     expect(onToken).toHaveBeenCalledWith("ok")
     expect(onDone).toHaveBeenCalledTimes(1)
     expect(onError).not.toHaveBeenCalled()
+  })
+
+  it("sends nothing for off while no stop-thinking method is configured", async () => {
+    // The default contract: an untouched custom config must behave exactly as it
+    // did before the selector existed, even with reasoning off.
+    mockHttpFetch.mockImplementation(async () => sseResponse(openAiSseToken("ok")))
+    const onNotice = vi.fn()
+
+    await streamChat(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone: vi.fn(), onError: vi.fn(), onNotice },
+      undefined,
+      { reasoning: { mode: "off" }, max_tokens: 4_096 },
+    )
+
+    const body = JSON.parse(String(mockHttpFetch.mock.calls[0][1]?.body))
+    expect(body.chat_template_kwargs).toBeUndefined()
+    expect(body.enable_thinking).toBeUndefined()
+    expect(body.thinking).toBeUndefined()
+    expect(body.reasoning_effort).toBeUndefined()
+    expect(onNotice).not.toHaveBeenCalled()
   })
 
   it("also falls back when the config, not an override, asked for off", async () => {
@@ -531,7 +559,11 @@ describe("streamChat — buffered streaming responses", () => {
     // override, so their effective mode comes from the config. The fallback must
     // fire for them too, which is why the guard asks the body builder's own
     // predicate instead of re-reading `requestOverrides`.
-    const configOff: LlmConfig = { ...customStreamingCfg, reasoning: { mode: "off" } }
+    const configOff: LlmConfig = {
+      ...customStreamingCfg,
+      reasoning: { mode: "off" },
+      reasoningDisable: "chat_template_kwargs",
+    }
     mockHttpFetch
       .mockResolvedValueOnce(new Response(JSON.stringify({
         error: { message: "Extra inputs are not permitted: chat_template_kwargs" },

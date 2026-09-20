@@ -1,8 +1,9 @@
-import type { LlmConfig } from "@/stores/wiki-store"
+import type { LlmConfig, ReasoningDisableStrategy } from "@/stores/wiki-store"
 import { isAzureOpenAiEndpoint } from "@/lib/azure-openai"
 import {
   appliesPortableReasoningDisable,
   getProviderConfig,
+  reasoningDisableStrategyFor,
   type RequestOverrides,
 } from "./llm-providers"
 import { getHttpFetch, isFetchNetworkError } from "./tauri-fetch"
@@ -14,6 +15,13 @@ export { isFetchNetworkError } from "./tauri-fetch"
 export interface StreamCallbacks {
   onToken: (token: string) => void
   onReasoningToken?: (token: string) => void
+  /**
+   * Non-fatal, user-visible note about a decision the transport made (e.g. a
+   * gateway rejecting the stop-thinking field and the request continuing with
+   * thinking enabled). Callers that surface warnings to the user should pass
+   * this through; it never replaces onDone/onError.
+   */
+  onNotice?: (notice: string) => void
   onDone: () => void
   onError: (error: Error) => void
 }
@@ -202,6 +210,22 @@ function shouldRetryWithoutReasoningFields(
   return REASONING_DISABLE_FIELD_HINTS.some((hint) => detail.includes(hint))
 }
 
+/** Wire field names, for the notice a rejected stop-thinking request raises. */
+const REASONING_DISABLE_FIELD_NAMES: Partial<Record<ReasoningDisableStrategy, string>> = {
+  chat_template_kwargs: "chat_template_kwargs",
+  enable_thinking: "enable_thinking",
+  thinking_disabled: "thinking",
+  reasoning_effort_none: "reasoning_effort",
+}
+
+function fieldNameForReasoningDisable(
+  config: LlmConfig,
+  requestOverrides?: RequestOverrides,
+): string {
+  const strategy = reasoningDisableStrategyFor(config, requestOverrides)
+  return REASONING_DISABLE_FIELD_NAMES[strategy] ?? "the stop-thinking field"
+}
+
 export async function streamChat(
   config: LlmConfig,
   messages: import("./llm-providers").ChatMessage[],
@@ -354,10 +378,14 @@ export async function streamChat(
       return streamChat(config, messages, callbacks, signal, retryOverrides)
     }
     if (shouldRetryWithoutReasoningFields(config, response.status, errorDetail, requestOverrides)) {
-      // The gateway rejected the "stop thinking" fields. Re-issue with thinking
-      // left on: the user asked for off, but a working ingest with thinking
-      // beats a hard failure, and the reasoning-only retry still covers a
-      // runaway chain-of-thought.
+      // The gateway rejected the field the user chose to stop thinking, so this
+      // request continues with thinking enabled. That is a downgrade of an
+      // explicit user choice, so it is reported rather than applied silently.
+      const notice =
+        `The endpoint rejected ${fieldNameForReasoningDisable(config, requestOverrides)}, ` +
+        `so this request continued with thinking enabled.`
+      if (callbacks.onNotice) callbacks.onNotice(notice)
+      else console.warn(`[llm-client] ${notice}`)
       settle()
       return streamChat(config, messages, callbacks, signal, {
         ...(requestOverrides ?? {}),
@@ -681,6 +709,7 @@ export async function streamChatWithReasoningRetry(
             callbacks.onToken(token)
           },
           onReasoningToken: callbacks.onReasoningToken,
+          onNotice: callbacks.onNotice,
           onDone: () => resolve(undefined),
           onError: (err) => resolve(err),
         },

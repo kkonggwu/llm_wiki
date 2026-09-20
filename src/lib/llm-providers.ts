@@ -1,4 +1,4 @@
-import type { LlmConfig, ReasoningConfig } from "@/stores/wiki-store"
+import type { LlmConfig, ReasoningConfig, ReasoningDisableStrategy } from "@/stores/wiki-store"
 import { computeContextBudget } from "@/lib/context-budget"
 import {
   AZURE_OPENAI_API_VERSION,
@@ -349,20 +349,33 @@ function effectiveReasoning(config: LlmConfig, overrides?: RequestOverrides): Re
 }
 
 /**
- * Single source of truth for "does this exact request carry the generic
- * stop-thinking fields". `buildOpenAiCompatibleBody` writes them, and
- * `llm-client`'s 400 fallback decides whether a rejection could have been
- * caused by them — reading the same predicate means the two cannot disagree.
- * Note the wire check: the Anthropic-wire builder never adds these fields, so a
- * 400 there must not trigger the fallback.
+ * Which stop-thinking method this exact request should use, or `"none"` when it
+ * should send nothing. Custom OpenAI-compatible endpoints only: the Anthropic
+ * wire never carries these fields, and first-party providers have their own
+ * mappings.
+ *
+ * Exported because `llm-client`'s 400 fallback has to know whether a rejection
+ * could have been caused by these fields — reading the same function means the
+ * builder and the fallback can never disagree.
+ */
+export function reasoningDisableStrategyFor(
+  config: LlmConfig,
+  overrides?: RequestOverrides,
+): ReasoningDisableStrategy {
+  if (config.provider !== "custom") return "none"
+  if ((config.apiMode ?? "chat_completions") !== "chat_completions") return "none"
+  if (effectiveReasoning(config, overrides).mode !== "off") return "none"
+  return config.reasoningDisable ?? "none"
+}
+
+/**
+ * Whether this request carries any stop-thinking field at all.
  */
 export function appliesPortableReasoningDisable(
   config: LlmConfig,
   overrides?: RequestOverrides,
 ): boolean {
-  if (config.provider !== "custom") return false
-  if ((config.apiMode ?? "chat_completions") !== "chat_completions") return false
-  return effectiveReasoning(config, overrides).mode === "off"
+  return reasoningDisableStrategyFor(config, overrides) !== "none"
 }
 
 function isDeepSeekEndpoint(config: LlmConfig): boolean {
@@ -536,18 +549,23 @@ function buildOpenAiCompatibleBody(
     return body
   }
 
-  if (appliesPortableReasoningDisable(config, overrides)) {
-    // Portable "stop thinking" hints for a generic OpenAI-compatible gateway.
-    // `chat_template_kwargs` is what vLLM / SGLang / llama.cpp (--jinja) hand to
-    // the model's chat template; `reasoning_effort: "none"` is the OpenAI-style
-    // knob the Ollama path above already uses. This is the behaviour v0.6.7
-    // removed (401bf26): without it a thinking model behind a generic gateway
-    // cannot be stopped, and its chain-of-thought can consume the whole output
-    // budget (issue #743). Gateways that reject either field are handled by the
-    // retry-without-reasoning fallback in llm-client, so this cannot turn into
-    // a hard failure.
-    body.chat_template_kwargs = { enable_thinking: false }
-    body.reasoning_effort = "none"
+  const disableStrategy = reasoningDisableStrategyFor(config, overrides)
+  if (disableStrategy !== "none") {
+    // The user picked a documented "stop thinking" method for this gateway.
+    // Deliberately one field per method: mixing them means a gateway that
+    // accepts one and rejects another loses both on the 400 fallback, and it
+    // makes "which field did my endpoint dislike" impossible to answer.
+    // Gateways that reject the field still complete the request via
+    // llm-client's retry-without-reasoning fallback.
+    if (disableStrategy === "chat_template_kwargs") {
+      body.chat_template_kwargs = { enable_thinking: false }
+    } else if (disableStrategy === "enable_thinking") {
+      body.enable_thinking = false
+    } else if (disableStrategy === "thinking_disabled") {
+      body.thinking = { type: "disabled" }
+    } else if (disableStrategy === "reasoning_effort_none") {
+      body.reasoning_effort = "none"
+    }
   }
 
   if (config.provider === "openai" && reasoning.mode !== "auto" && reasoning.mode !== "off") {

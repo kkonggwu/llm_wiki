@@ -1034,6 +1034,12 @@ async function autoIngestImpl(
 
   let analysis = precomputedAnalysis
 
+  // Non-fatal transport notices raised while streamed answers are produced
+  // (for example a gateway rejecting the stop-thinking field, which silently
+  // re-enables thinking). Surfaced with the ingest warnings so the user sees the
+  // downgrade instead of only finding it in a log.
+  const streamNotices: string[] = []
+
   if (!analysis) {
     await streamChatWithReasoningRetry(
       llmConfig,
@@ -1043,6 +1049,7 @@ async function autoIngestImpl(
       ],
       {
         onToken: (token) => { analysis += token },
+        onNotice: (notice) => { streamNotices.push(notice) },
         onDone: () => {},
         onError: (err) => {
           activity.updateItem(activityId, { status: "error", detail: `Analysis failed: ${err.message}` })
@@ -1107,6 +1114,7 @@ async function autoIngestImpl(
     ],
     {
       onToken: (token) => { generation += token },
+      onNotice: (notice) => { streamNotices.push(notice) },
       onDone: () => {},
       onError: (err) => {
         activity.updateItem(activityId, { status: "error", detail: `Generation failed: ${err.message}` })
@@ -1191,6 +1199,8 @@ async function autoIngestImpl(
   throwIfIngestAborted(signal, activityId)
   const writtenPaths = writeResult.writtenPaths
   const writeWarnings = writeResult.warnings
+  // Transport-level downgrades reported while streaming (see streamNotices).
+  writeWarnings.push(...streamNotices)
   const hardFailures = writeResult.hardFailures
   let unrecoveredTruncatedPaths = uniqueNormalizedPaths(
     writeResult.truncatedPaths.filter((path) =>

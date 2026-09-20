@@ -943,9 +943,38 @@ describe("reasoning controls", () => {
     expect(body.reasoning_effort).toBeUndefined()
   })
 
-  it("stops thinking on a generic custom gateway when reasoning is off", () => {
-    // v0.6.7 (401bf26) removed this mapping from the custom path, leaving a
-    // thinking model behind a gateway with no way to be stopped (#743).
+  it("sends exactly the stop-thinking field the user selected", () => {
+    const cases = [
+      ["chat_template_kwargs", { chat_template_kwargs: { enable_thinking: false } }],
+      ["enable_thinking", { enable_thinking: false }],
+      ["thinking_disabled", { thinking: { type: "disabled" } }],
+      ["reasoning_effort_none", { reasoning_effort: "none" }],
+    ] as const
+
+    for (const [reasoningDisable, expected] of cases) {
+      const cfg = mkConfig({
+        provider: "custom",
+        model: "Qwen3-32B",
+        customEndpoint: "https://gateway.example/v1",
+        reasoningDisable,
+      })
+      const body = getProviderConfig(cfg).buildBody(
+        [{ role: "user", content: "hi" }],
+        { reasoning: { mode: "off" }, temperature: 0.1, max_tokens: 4096 },
+      ) as Record<string, unknown>
+
+      // One field per method: mixing them would mean a gateway that accepts one
+      // and rejects the other loses both on the 400 fallback.
+      expect(body).toMatchObject(expected)
+      const disableFields = ["chat_template_kwargs", "enable_thinking", "thinking", "reasoning_effort"]
+        .filter((field) => body[field] !== undefined)
+      expect(disableFields).toHaveLength(1)
+    }
+  })
+
+  it("sends nothing for off while no stop-thinking method is configured", () => {
+    // The default contract: an untouched config behaves exactly as it did before
+    // the selector existed, even with reasoning off.
     const cfg = mkConfig({
       provider: "custom",
       model: "Qwen3-32B",
@@ -956,8 +985,10 @@ describe("reasoning controls", () => {
       { reasoning: { mode: "off" }, temperature: 0.1, max_tokens: 4096 },
     ) as Record<string, unknown>
 
-    expect(body.chat_template_kwargs).toEqual({ enable_thinking: false })
-    expect(body.reasoning_effort).toBe("none")
+    expect(body.chat_template_kwargs).toBeUndefined()
+    expect(body.enable_thinking).toBeUndefined()
+    expect(body.thinking).toBeUndefined()
+    expect(body.reasoning_effort).toBeUndefined()
   })
 
   it("sends no stop-thinking fields to a custom gateway when reasoning is auto", () => {
@@ -965,6 +996,7 @@ describe("reasoning controls", () => {
       provider: "custom",
       model: "Qwen3-32B",
       customEndpoint: "https://gateway.example/v1",
+      reasoningDisable: "chat_template_kwargs",
     })
     const body = getProviderConfig(cfg).buildBody(
       [{ role: "user", content: "hi" }],
