@@ -593,18 +593,40 @@ export async function autoIngest(
 ): Promise<string[]> {
   const pp = normalizePath(projectPath)
   const sp = normalizePath(sourcePath)
-  return withProjectLock(
-    `ingest-source\0${pp}\0${sp}`,
-    () => autoIngestImpl(
-      projectPath,
-      sourcePath,
-      llmConfig,
-      signal,
-      folderContext,
-      onFileWritten,
-      options,
-    ),
-  )
+  // One sink for the whole run. A failure anywhere — including inside the
+  // commit phase, after the ingest warnings were assembled — must still report
+  // a downgrade: the queue records only the thrown message, and the ingest
+  // warning log is never written on that path.
+  const notices = createIngestNoticeSink()
+  try {
+    return await withProjectLock(
+      `ingest-source\0${pp}\0${sp}`,
+      () => autoIngestImpl(
+        projectPath,
+        sourcePath,
+        llmConfig,
+        signal,
+        folderContext,
+        onFileWritten,
+        options,
+        notices,
+      ),
+    )
+  } catch (err) {
+    const failure = err instanceof Error ? err : new Error(String(err))
+    const message = notices.appendedTo(failure.message)
+    if (message !== failure.message) {
+      if (notices.activityId) {
+        useActivityStore.getState().updateItem(notices.activityId, {
+          status: "error",
+          detail: message,
+        })
+      }
+      // Keep the error identity and stack; only its message grows.
+      failure.message = message
+    }
+    throw failure
+  }
 }
 
 function throwIfIngestAborted(signal: AbortSignal | undefined, activityId?: string): void {
@@ -670,6 +692,8 @@ async function autoIngestImpl(
   folderContext?: string,
   onFileWritten?: (relativePath: string) => void,
   options?: AutoIngestOptions,
+  // Created by `autoIngest`, which also reports the notices when this throws.
+  notices: IngestNoticeSink = createIngestNoticeSink(),
 ): Promise<string[]> {
   const pp = normalizePath(projectPath)
   const sp = normalizePath(sourcePath)
@@ -690,6 +714,8 @@ async function autoIngestImpl(
     detail: "Reading source...",
     filesWritten: [],
   })
+  // So a later failure can attach collected notices to the visible activity item.
+  notices.activityId = activityId
 
   // ── MinerU preprocessing for PDF files ──
   const lowerExt = fileName.includes(".") ? fileName.split(".").pop()?.toLowerCase() : ""
@@ -1000,7 +1026,6 @@ async function autoIngestImpl(
   let sourceContext = enrichedSourceContent
   let precomputedAnalysis = ""
   let longSourceCheckpointPath: string | undefined
-  const notices = createIngestNoticeSink()
 
   if (enrichedSourceContent.length > sourceBudget) {
     const longSourcePlan = await analyzeLongSourceInChunks(
@@ -1065,7 +1090,8 @@ async function autoIngestImpl(
   // processNext's catch-block path (retry / mark failed) engages.
   const analysisActivity = useActivityStore.getState().items.find((i) => i.id === activityId)
   if (analysisActivity?.status === "error") {
-    throw new Error(notices.appendedTo(analysisActivity.detail || "Analysis stream failed"))
+    // `autoIngest` attaches any collected downgrade notices to this throw.
+    throw new Error(analysisActivity.detail || "Analysis stream failed")
   }
 
   // ── Step 2: Generation ────────────────────────────────────────
@@ -1126,7 +1152,7 @@ async function autoIngestImpl(
 
   const generationActivity = useActivityStore.getState().items.find((i) => i.id === activityId)
   if (generationActivity?.status === "error") {
-    throw new Error(notices.appendedTo(generationActivity.detail || "Generation stream failed"))
+    throw new Error(generationActivity.detail || "Generation stream failed")
   }
   throwIfIngestAborted(signal, activityId)
 
@@ -2922,28 +2948,36 @@ function buildChunkAnalysisUserPrompt(
  */
 interface IngestNoticeSink {
   push: (notice: string) => void
+  /** Everything seen so far, de-duplicated (used by failure exits). */
+  all: () => string[]
+  /** Take the notices not yet reported to the ingest warning list. */
   drain: () => string[]
+  /** Message with every notice attached, or unchanged when there are none. */
   appendedTo: (message: string) => string
+  /** Activity item to update when the run fails before warnings exist. */
+  activityId?: string
 }
 
 function createIngestNoticeSink(): IngestNoticeSink {
   const seen = new Set<string>()
+  const history: string[] = []
   let pending: string[] = []
-  const drain = () => {
-    const drained = pending
-    pending = []
-    return drained
-  }
   return {
     push: (notice) => {
       if (seen.has(notice)) return
       seen.add(notice)
+      history.push(notice)
       pending.push(notice)
     },
-    drain,
+    all: () => [...history],
+    drain: () => {
+      const drained = pending
+      pending = []
+      return drained
+    },
     appendedTo: (message) => {
-      const drained = drain()
-      return drained.length === 0 ? message : `${message} (${drained.join("; ")})`
+      const notices = [...history]
+      return notices.length === 0 ? message : `${message} (${notices.join("; ")})`
     },
   }
 }
@@ -3035,7 +3069,7 @@ async function analyzeLongSourceInChunks(
     )
 
     throwIfIngestAborted(signal, activityId)
-    if (hadError) throw new Error(notices?.appendedTo("Chunk analysis stream failed") ?? "Chunk analysis stream failed")
+    if (hadError) throw new Error("Chunk analysis stream failed")
 
     const chunkAnalysis = extractMarkedSection(raw, "Chunk Analysis") || raw.trim()
     const nextDigest = extractMarkedSection(raw, "Updated Global Digest")

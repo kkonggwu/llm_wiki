@@ -273,4 +273,80 @@ describe("ingest recovers from a reasoning-only analysis (#743)", () => {
     expect(await readFileRaw(pagePath)).toContain("PAGE-WRITTEN-AFTER-RETRY")
     expect(useActivityStore.getState().items.filter((i) => i.status === "error")).toHaveLength(0)
   })
+
+  it("keeps a collected downgrade notice when a later stage fails", async () => {
+    const projectPath = ctx!.path
+    useWikiStore.getState().setLlmConfig({
+      ...useWikiStore.getState().llmConfig,
+      reasoningDisable: "chat_template_kwargs",
+      ingestReasoning: { mode: "off" },
+    })
+
+    const rejected = {
+      status: 400,
+      body: JSON.stringify({ error: { message: "invalid request body" } }),
+    }
+    scriptedResponses = [
+      rejected,                             // 1: analysis with the field
+      sse(contentRecord(ANALYSIS_MARKER)),  // 2: analysis retried without it -> notice
+      rejected,                             // 3: generation with the field
+      rejected,                             // 4: generation retry fails too
+    ]
+
+    let thrown: Error | undefined
+    try {
+      await autoIngest(
+        projectPath,
+        `${projectPath}/raw/sources/reasoning-chunk.md`,
+        useWikiStore.getState().llmConfig,
+      )
+    } catch (err) {
+      thrown = err as Error
+    }
+
+    // The downgrade happened, so the failure must still report it: the queue
+    // records only this message.
+    expect(thrown).toBeDefined()
+    expect(String(thrown?.message)).toContain("retrying without chat_template_kwargs succeeded")
+    expect(String(thrown?.message)).toContain("Generation failed")
+    // ...and the visible activity item carries it too.
+    const errored = useActivityStore.getState().items.filter((i) => i.status === "error")
+    expect(errored.length).toBeGreaterThan(0)
+    expect(String(errored[0].detail)).toContain("retrying without chat_template_kwargs succeeded")
+  })
+
+  it("keeps a collected downgrade notice when the commit phase fails", async () => {
+    const projectPath = ctx!.path
+    useWikiStore.getState().setLlmConfig({
+      ...useWikiStore.getState().llmConfig,
+      reasoningDisable: "chat_template_kwargs",
+      ingestReasoning: { mode: "off" },
+    })
+
+    scriptedResponses = [
+      { status: 400, body: JSON.stringify({ error: { message: "invalid request body" } }) },
+      sse(contentRecord(ANALYSIS_MARKER)),   // analysis retried without the field -> notice
+      generationStream(),                    // generation
+    ]
+
+    let thrown: Error | undefined
+    try {
+      await autoIngest(
+        projectPath,
+        `${projectPath}/raw/sources/reasoning-chunk.md`,
+        useWikiStore.getState().llmConfig,
+        undefined,
+        undefined,
+        undefined,
+        // The warnings assembled during the run are never written when the
+        // commit fails, so the notice has to ride on the thrown error instead.
+        { runCommit: () => Promise.reject(new Error("commit runner unavailable")) },
+      )
+    } catch (err) {
+      thrown = err as Error
+    }
+
+    expect(String(thrown?.message)).toContain("commit runner unavailable")
+    expect(String(thrown?.message)).toContain("retrying without chat_template_kwargs succeeded")
+  })
 })

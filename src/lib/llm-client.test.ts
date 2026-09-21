@@ -539,10 +539,114 @@ describe("streamChat — buffered streaming responses", () => {
     expect(onToken).toHaveBeenCalledWith("ok")
   })
 
-  it("does not retry a fuzzy rejection that names no field", async () => {
+  it("retries once even when the rejection names no field", async () => {
+    // Recovery-first: a gateway rejecting an unknown key often says only
+    // "invalid request body", and not trying can cost the whole page.
+    const config: LlmConfig = { ...customStreamingCfg, reasoningDisable: "enable_thinking" }
+    mockHttpFetch
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: "invalid request body" },
+      }), { status: 400 }))
+      .mockResolvedValueOnce(sseResponse(openAiSseToken("ok")))
+
+    const onToken = vi.fn()
+    const onNotice = vi.fn()
+
+    await streamChat(
+      config,
+      [{ role: "user", content: "hi" }],
+      { onToken, onDone: vi.fn(), onError: vi.fn(), onNotice },
+      undefined,
+      { reasoning: { mode: "off" }, max_tokens: 4_096 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(String(mockHttpFetch.mock.calls[1][1]?.body)).enable_thinking).toBeUndefined()
+    expect(onToken).toHaveBeenCalledWith("ok")
+    // The notice states outcomes, not causes.
+    const notice = String(onNotice.mock.calls[0][0])
+    expect(notice).toContain("retrying without enable_thinking succeeded")
+    expect(notice).not.toContain("rejected")
+  })
+
+  it("reports both errors when the recovery attempt also fails", async () => {
     const config: LlmConfig = { ...customStreamingCfg, reasoningDisable: "enable_thinking" }
     mockHttpFetch.mockImplementation(async () => new Response(JSON.stringify({
       error: { message: "invalid request body" },
+    }), { status: 400 }))
+
+    const onNotice = vi.fn()
+    const onError = vi.fn()
+
+    await streamChat(
+      config,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone: vi.fn(), onError, onNotice },
+      undefined,
+      { reasoning: { mode: "off" }, max_tokens: 4_096 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(2)
+    expect(onNotice).not.toHaveBeenCalled()
+    const message = String(onError.mock.calls[0][0].message)
+    expect(message).toContain("invalid request body")
+    expect(message).toContain("also failed")
+  })
+
+  it("delivers the notice before the terminal callback", async () => {
+    const config: LlmConfig = { ...customStreamingCfg, reasoningDisable: "chat_template_kwargs" }
+    mockHttpFetch
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: "Unrecognized request argument: chat_template_kwargs" },
+      }), { status: 400 }))
+      .mockResolvedValueOnce(sseResponse(openAiSseToken("ok")))
+
+    const order: string[] = []
+
+    await streamChat(
+      config,
+      [{ role: "user", content: "hi" }],
+      {
+        onToken: vi.fn(),
+        onNotice: () => { order.push("notice") },
+        onDone: () => { order.push("done") },
+        onError: () => { order.push("error") },
+      },
+      undefined,
+      { reasoning: { mode: "off" }, max_tokens: 4_096 },
+    )
+
+    // Callers finalize state (and persist warnings) on onDone.
+    expect(order).toEqual(["notice", "done"])
+  })
+
+  it("puts nothing on the wire when the caller cancelled before the attempt", async () => {
+    const config: LlmConfig = { ...customStreamingCfg, reasoningDisable: "chat_template_kwargs" }
+    mockHttpFetch.mockImplementation(async () => sseResponse(openAiSseToken("ok")))
+
+    const controller = new AbortController()
+    controller.abort()
+    const onDone = vi.fn()
+    const onError = vi.fn()
+
+    await streamChat(
+      config,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone, onError },
+      controller.signal,
+      { reasoning: { mode: "off" }, max_tokens: 4_096 },
+    )
+
+    // An abort that happened before we subscribed never fires the listener.
+    expect(mockHttpFetch).not.toHaveBeenCalled()
+    expect(onDone).toHaveBeenCalledTimes(1)
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it("keeps the request count bounded when every attempt fails", async () => {
+    const config: LlmConfig = { ...customStreamingCfg, reasoningDisable: "chat_template_kwargs" }
+    mockHttpFetch.mockImplementation(async () => new Response(JSON.stringify({
+      error: { message: "Unsupported parameter: temperature" },
     }), { status: 400 }))
 
     const onError = vi.fn()
@@ -552,11 +656,12 @@ describe("streamChat — buffered streaming responses", () => {
       [{ role: "user", content: "hi" }],
       { onToken: vi.fn(), onDone: vi.fn(), onError },
       undefined,
-      { reasoning: { mode: "off" }, max_tokens: 4_096 },
+      { temperature: 0.1, reasoning: { mode: "off" }, max_tokens: 4_096 },
     )
 
-    // Retrying blindly would double every unrelated 400; report instead.
-    expect(mockHttpFetch).toHaveBeenCalledTimes(1)
+    // 1 temperature rejected -> 2 retried without it -> rejected -> 3 retried
+    // without the stop-thinking field; then it stops. Bounded, not a loop.
+    expect(mockHttpFetch.mock.calls.length).toBeLessThanOrEqual(4)
     expect(onError).toHaveBeenCalledTimes(1)
   })
 

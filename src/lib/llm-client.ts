@@ -175,41 +175,27 @@ function shouldRetryWithoutTemperature(
 /**
  * Field names the provider layer adds when a generic custom gateway is asked to
  * stop thinking (`reasoning: { mode: "off" }`). A gateway that does not know
- * them answers 400/422; we then re-issue the request with thinking left on so an
+ * them answers 400/422; we then re-issue the request without the field so an
  * ingest still runs instead of failing outright.
- *
- * Only the field this request actually carries can be blamed for such a
- * rejection, so the field names themselves are always checked against the wire
- * plan. The generic phrases cover gateways that reject unknown keys without
- * naming them; they stay deliberately narrow, because "not permitted" and
- * friends also appear on unrelated schema errors where re-issuing would only
- * burn a request. A fuzzy rejection that names nothing therefore fails loudly
- * instead of being retried blindly.
  */
-const GENERIC_UNKNOWN_FIELD_HINTS = [
-  "extra inputs",
-  "extra_forbidden",
-  "unexpected keyword",
-  "unknown field",
-]
-
 function shouldRetryWithoutReasoningFields(
   config: LlmConfig,
   status: number,
-  errorDetail: string,
   requestOverrides?: RequestOverrides,
 ): boolean {
   if (status !== 400 && status !== 422) return false
-  // Ask the body builder's own plan what *this* request carried. Re-deriving it
-  // from `requestOverrides` was wrong (the effective mode can come from the
-  // config), and so was asking only about the strategy: endpoints with a native
-  // mapping return before the generic path, so they never carry the explicit
-  // field at all.
-  const plan = resolveReasoningWirePlan(config, requestOverrides)
-  if (plan.source !== "explicit") return false
-  const detail = errorDetail.toLowerCase()
-  if (plan.fields.some((field) => detail.includes(field.toLowerCase()))) return true
-  return GENERIC_UNKNOWN_FIELD_HINTS.some((hint) => detail.includes(hint))
+  // Recovery-first: any 400/422 on a request that carried an explicit
+  // stop-thinking field gets one retry without it. Only retrying when the error
+  // text happens to name the field would hand the user a hard failure — a lost
+  // page — in exactly the situation where the field is the most likely cause
+  // (an unknown gateway rejecting an unknown key often says only "invalid
+  // request body"). The cost of being wrong is one extra request; the cost of
+  // not trying can be the whole import. The single retry is bounded, and its
+  // notice states only what the two outcomes actually prove.
+  //
+  // Which field, and whether the request carried one at all, comes from the
+  // wire plan — never from re-deriving it here.
+  return resolveReasoningWirePlan(config, requestOverrides).source === "explicit"
 }
 
 /** The field a rejected explicit plan carried, for the user-visible notice. */
@@ -329,6 +315,16 @@ export async function streamChat(
     combinedSignal = timeoutController.signal
   }
 
+  // An abort that happened *before* this call registered its listener never
+  // fires it, so the transport would still put the request on the wire — the
+  // 400 fallback can race exactly like this (the caller cancels while the first
+  // response is being read). Cancellation wins here, silently, like any other
+  // cancel.
+  if (signal?.aborted) {
+    onDone()
+    return
+  }
+
   let response: Response
   try {
     const body = providerConfig.buildBody(messages, requestOverrides)
@@ -385,7 +381,7 @@ export async function streamChat(
       settle()
       return streamChat(config, messages, callbacks, signal, retryOverrides)
     }
-    if (shouldRetryWithoutReasoningFields(config, response.status, errorDetail, requestOverrides)) {
+    if (shouldRetryWithoutReasoningFields(config, response.status, requestOverrides)) {
       // Hand the backstop to the re-issued request first: a throwing notice
       // handler must not be able to skip cleanup or the retry itself.
       settle()
@@ -410,15 +406,20 @@ export async function streamChat(
         retryOverrides,
       )
       if (retrySucceeded) {
-        callbacks.onDone()
-        // The downgrade is only a fact once the re-issued request worked; a
-        // cancelled run must not claim thinking was left enabled.
+        // State only what the two outcomes prove: the first request failed and
+        // the retry without the field worked. Whether the gateway objected to
+        // the field, and what it does with thinking by default, is not something
+        // this code can know.
         if (!signal?.aborted) {
           raiseNotice(
             callbacks,
-            `The endpoint rejected ${field}, so this request continued with thinking enabled.`,
+            `The first request failed with ${response.status}; retrying without ` +
+            `${field} succeeded, so this answer uses the endpoint's default thinking behaviour.`,
           )
         }
+        // Deliver the notice before the terminal callback: callers finalize
+        // (and persist warnings) on onDone.
+        callbacks.onDone()
       } else {
         callbacks.onError(new Error(
           `${errorDetail} (retrying without ${field} also failed: ` +

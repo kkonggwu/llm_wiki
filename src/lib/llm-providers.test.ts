@@ -893,8 +893,45 @@ describe("reasoning controls", () => {
     expect(body.chat_template_kwargs).toBeUndefined()
   })
 
-  it("reports no plan on the Anthropic wire or when reasoning is not off", () => {
-    const anthropicWire = mkConfig({
+  it("keeps the wire plan and the request body in agreement", () => {
+    const explicitFieldFor: Record<string, string> = {
+      chat_template_kwargs: "chat_template_kwargs",
+      enable_thinking: "enable_thinking",
+      thinking_disabled: "thinking",
+      reasoning_effort_none: "reasoning_effort",
+    }
+    const cases: Array<Partial<LlmConfig>> = [
+      { model: "qwen3", customEndpoint: "https://gateway.example/v1", reasoningDisable: "chat_template_kwargs" },
+      { model: "qwen3", customEndpoint: "https://gateway.example/v1", reasoningDisable: "enable_thinking" },
+      { model: "qwen3", customEndpoint: "https://gateway.example/v1", reasoningDisable: "thinking_disabled" },
+      { model: "qwen3", customEndpoint: "https://gateway.example/v1", reasoningDisable: "reasoning_effort_none" },
+      { model: "qwen3", customEndpoint: "https://gateway.example/v1" },
+      { model: "mimo-v2.5", customEndpoint: "https://token-plan-cn.xiaomimimo.com/v1", reasoningDisable: "chat_template_kwargs" },
+      { model: "deepseek-v4-flash", customEndpoint: "https://api.deepseek.com/v1", reasoningDisable: "chat_template_kwargs" },
+      { model: "vendor/x", customEndpoint: "https://openrouter.ai/api/v1", reasoningDisable: "chat_template_kwargs" },
+    ]
+
+    for (const over of cases) {
+      const cfg = mkConfig({ provider: "custom", apiMode: "chat_completions", ...over })
+      const overrides = { reasoning: { mode: "off" as const }, max_tokens: 4096 }
+      const plan = resolveReasoningWirePlan(cfg, overrides)
+      const body = getProviderConfig(cfg).buildBody(
+        [{ role: "user", content: "hi" }],
+        overrides,
+      ) as Record<string, unknown>
+      const label = JSON.stringify(over)
+
+      if (plan.source === "explicit") {
+        const present = Object.values(explicitFieldFor).filter((field) => body[field] !== undefined)
+        expect(present, label).toEqual([...plan.fields])
+      } else if (over.reasoningDisable) {
+        // Native or absent plan: the generic field must never ride along.
+        expect(body[explicitFieldFor[over.reasoningDisable]], label).toBeUndefined()
+      }
+    }
+  })
+
+  it("reports no plan on the Anthropic wire or when reasoning is not off", () => {    const anthropicWire = mkConfig({
       provider: "custom",
       model: "mimo-v2.5",
       customEndpoint: "https://token-plan-cn.xiaomimimo.com/anthropic",
