@@ -1,9 +1,8 @@
-import type { LlmConfig, ReasoningDisableStrategy } from "@/stores/wiki-store"
+import type { LlmConfig } from "@/stores/wiki-store"
 import { isAzureOpenAiEndpoint } from "@/lib/azure-openai"
 import {
-  appliesPortableReasoningDisable,
   getProviderConfig,
-  reasoningDisableStrategyFor,
+  resolveReasoningWirePlan,
   type RequestOverrides,
 } from "./llm-providers"
 import { getHttpFetch, isFetchNetworkError } from "./tauri-fetch"
@@ -178,15 +177,16 @@ function shouldRetryWithoutTemperature(
  * stop thinking (`reasoning: { mode: "off" }`). A gateway that does not know
  * them answers 400/422; we then re-issue the request with thinking left on so an
  * ingest still runs instead of failing outright.
+ *
+ * Only the field this request actually carries can be blamed for such a
+ * rejection, so the field names themselves are always checked against the wire
+ * plan. The generic phrases cover gateways that reject unknown keys without
+ * naming them; they stay deliberately narrow, because "not permitted" and
+ * friends also appear on unrelated schema errors where re-issuing would only
+ * burn a request. A fuzzy rejection that names nothing therefore fails loudly
+ * instead of being retried blindly.
  */
-const REASONING_DISABLE_FIELD_HINTS = [
-  // The field names themselves are the most reliable signal.
-  "chat_template_kwargs",
-  "enable_thinking",
-  "reasoning_effort",
-  // Gateways that reject unknown keys without naming them. Deliberately narrow:
-  // generic phrases like "not permitted" also appear on unrelated schema errors,
-  // where re-issuing would only burn a request.
+const GENERIC_UNKNOWN_FIELD_HINTS = [
   "extra inputs",
   "extra_forbidden",
   "unexpected keyword",
@@ -200,30 +200,38 @@ function shouldRetryWithoutReasoningFields(
   requestOverrides?: RequestOverrides,
 ): boolean {
   if (status !== 400 && status !== 422) return false
-  // Ask the body builder's own predicate whether *this* request carried the
-  // fields. Re-deriving it from `requestOverrides` was wrong: the effective
-  // reasoning can come from the config (chat reasoning), which is how callers
-  // that pass no reasoning override — lint, deep research, enrich-wikilinks —
-  // ended up sending the fields with no fallback behind them.
-  if (!appliesPortableReasoningDisable(config, requestOverrides)) return false
+  // Ask the body builder's own plan what *this* request carried. Re-deriving it
+  // from `requestOverrides` was wrong (the effective mode can come from the
+  // config), and so was asking only about the strategy: endpoints with a native
+  // mapping return before the generic path, so they never carry the explicit
+  // field at all.
+  const plan = resolveReasoningWirePlan(config, requestOverrides)
+  if (plan.source !== "explicit") return false
   const detail = errorDetail.toLowerCase()
-  return REASONING_DISABLE_FIELD_HINTS.some((hint) => detail.includes(hint))
+  if (plan.fields.some((field) => detail.includes(field.toLowerCase()))) return true
+  return GENERIC_UNKNOWN_FIELD_HINTS.some((hint) => detail.includes(hint))
 }
 
-/** Wire field names, for the notice a rejected stop-thinking request raises. */
-const REASONING_DISABLE_FIELD_NAMES: Partial<Record<ReasoningDisableStrategy, string>> = {
-  chat_template_kwargs: "chat_template_kwargs",
-  enable_thinking: "enable_thinking",
-  thinking_disabled: "thinking",
-  reasoning_effort_none: "reasoning_effort",
-}
-
+/** The field a rejected explicit plan carried, for the user-visible notice. */
 function fieldNameForReasoningDisable(
   config: LlmConfig,
   requestOverrides?: RequestOverrides,
 ): string {
-  const strategy = reasoningDisableStrategyFor(config, requestOverrides)
-  return REASONING_DISABLE_FIELD_NAMES[strategy] ?? "the stop-thinking field"
+  return resolveReasoningWirePlan(config, requestOverrides).fields[0] ?? "the stop-thinking field"
+}
+
+/**
+ * Deliver a non-fatal notice. Observational callbacks must never be able to
+ * break the transport state machine, so a throwing handler is swallowed (and
+ * reported) rather than propagated.
+ */
+function raiseNotice(callbacks: StreamCallbacks, notice: string): void {
+  try {
+    if (callbacks.onNotice) callbacks.onNotice(notice)
+    else console.warn(`[llm-client] ${notice}`)
+  } catch (err) {
+    console.warn("[llm-client] notice handler threw", err)
+  }
 }
 
 export async function streamChat(
@@ -378,19 +386,46 @@ export async function streamChat(
       return streamChat(config, messages, callbacks, signal, retryOverrides)
     }
     if (shouldRetryWithoutReasoningFields(config, response.status, errorDetail, requestOverrides)) {
-      // The gateway rejected the field the user chose to stop thinking, so this
-      // request continues with thinking enabled. That is a downgrade of an
-      // explicit user choice, so it is reported rather than applied silently.
-      const notice =
-        `The endpoint rejected ${fieldNameForReasoningDisable(config, requestOverrides)}, ` +
-        `so this request continued with thinking enabled.`
-      if (callbacks.onNotice) callbacks.onNotice(notice)
-      else console.warn(`[llm-client] ${notice}`)
+      // Hand the backstop to the re-issued request first: a throwing notice
+      // handler must not be able to skip cleanup or the retry itself.
       settle()
-      return streamChat(config, messages, callbacks, signal, {
+      const field = fieldNameForReasoningDisable(config, requestOverrides)
+      const retryOverrides = {
         ...(requestOverrides ?? {}),
-        reasoning: { mode: "auto" },
-      })
+        reasoning: { mode: "auto" as const },
+      }
+      let retrySucceeded = false
+      let retryFailure: Error | undefined
+      await streamChat(
+        config,
+        messages,
+        {
+          onToken,
+          onReasoningToken: callbacks.onReasoningToken,
+          onNotice: callbacks.onNotice,
+          onDone: () => { retrySucceeded = true },
+          onError: (err) => { retryFailure = err },
+        },
+        signal,
+        retryOverrides,
+      )
+      if (retrySucceeded) {
+        callbacks.onDone()
+        // The downgrade is only a fact once the re-issued request worked; a
+        // cancelled run must not claim thinking was left enabled.
+        if (!signal?.aborted) {
+          raiseNotice(
+            callbacks,
+            `The endpoint rejected ${field}, so this request continued with thinking enabled.`,
+          )
+        }
+      } else {
+        callbacks.onError(new Error(
+          `${errorDetail} (retrying without ${field} also failed: ` +
+          `${retryFailure?.message ?? "unknown error"})`,
+        ))
+      }
+      return
     }
     if (
       response.status === 404 &&
@@ -648,9 +683,10 @@ function nextReasoningRetryBudget(
 export interface ReasoningRetryOptions {
   /**
    * Upper bound for the retried output budget, defaulting to
-   * `REASONING_RETRY_MAX_TOKENS`. Callers that know the endpoint's real output
-   * ceiling should pass it: re-issuing above that ceiling only replaces the
-   * diagnostic with an HTTP 400.
+   * `REASONING_RETRY_MAX_TOKENS`. Experimental: no production caller knows the
+   * endpoint's real output ceiling yet, so this exists for callers that do (and
+   * for tests). Re-issuing above that ceiling only replaces the diagnostic with
+   * an HTTP 400.
    */
   maxTokensCeiling?: number
 }

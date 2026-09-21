@@ -23,16 +23,23 @@ import {
 
 vi.mock("@/commands/fs", () => realFs)
 
-/** Request bodies in call order, plus the scripted SSE body per call. */
+/** Request bodies in call order, plus the scripted response per call. */
 const requestBodies: string[] = []
-let scriptedResponses: string[] = []
+type ScriptedResponse = string | { status: number; body: string }
+let scriptedResponses: ScriptedResponse[] = []
 
 const mockHttpFetch = vi.fn(async (_url: string, opts?: RequestInit) => {
   requestBodies.push(String(opts?.body ?? ""))
-  const payload = scriptedResponses[requestBodies.length - 1] ?? ""
-  return new Response(payload, {
-    status: 200,
-    headers: { "Content-Type": "text/event-stream" },
+  const entry = scriptedResponses[requestBodies.length - 1] ?? ""
+  if (typeof entry === "string") {
+    return new Response(entry, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    })
+  }
+  return new Response(entry.body, {
+    status: entry.status,
+    headers: { "Content-Type": "application/json" },
   })
 })
 
@@ -216,6 +223,50 @@ describe("ingest recovers from a reasoning-only analysis (#743)", () => {
     expect(requestBodies).toHaveLength(3)
     expect(JSON.parse(requestBodies[1]).max_tokens).toBe(16_384)
     expect(JSON.parse(requestBodies[2]).max_tokens).toBe(32_768)
+
+    const pagePath = `${projectPath}/wiki/concepts/retry-proof.md`
+    expect(await fileExists(pagePath)).toBe(true)
+    expect(await readFileRaw(pagePath)).toContain("PAGE-WRITTEN-AFTER-RETRY")
+    expect(useActivityStore.getState().items.filter((i) => i.status === "error")).toHaveLength(0)
+  })
+
+  it("runs the whole chosen-method chain: send the field, get rejected, drop it, write the page", async () => {
+    const projectPath = ctx!.path
+
+    // The user picked a stop-thinking method and set ingest reasoning to off,
+    // which is the only combination that puts the field on the wire.
+    useWikiStore.getState().setLlmConfig({
+      ...useWikiStore.getState().llmConfig,
+      reasoningDisable: "chat_template_kwargs",
+      ingestReasoning: { mode: "off" },
+    })
+
+    scriptedResponses = [
+      // 1: the analysis request carries the field and the gateway rejects it.
+      {
+        status: 400,
+        body: JSON.stringify({
+          error: { message: "Unrecognized request argument supplied: chat_template_kwargs" },
+        }),
+      },
+      sse(contentRecord(ANALYSIS_MARKER)),   // 2: analysis retried without it
+      generationStream(),                    // 3: generation
+    ]
+
+    await autoIngest(
+      projectPath,
+      `${projectPath}/raw/sources/reasoning-chunk.md`,
+      useWikiStore.getState().llmConfig,
+    )
+
+    expect(requestBodies).toHaveLength(3)
+    const firstAnalysis = JSON.parse(requestBodies[0])
+    expect(firstAnalysis.chat_template_kwargs).toEqual({ enable_thinking: false })
+    // Only the selected method is sent, and the re-issue drops it.
+    expect(firstAnalysis.reasoning_effort).toBeUndefined()
+    expect(JSON.parse(requestBodies[1]).chat_template_kwargs).toBeUndefined()
+    // Generation was never part of the fallback, so it carries the field again.
+    expect(JSON.parse(requestBodies[2]).chat_template_kwargs).toEqual({ enable_thinking: false })
 
     const pagePath = `${projectPath}/wiki/concepts/retry-proof.md`
     expect(await fileExists(pagePath)).toBe(true)

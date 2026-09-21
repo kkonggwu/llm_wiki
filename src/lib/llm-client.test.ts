@@ -490,6 +490,139 @@ describe("streamChat — buffered streaming responses", () => {
     expect(onError).not.toHaveBeenCalled()
   })
 
+  it("does not blame a field the endpoint never carried", async () => {
+    // OpenRouter owns its reasoning mapping, so the explicit method is never
+    // sent and a 400 naming it must not be read as a rejection of our field.
+    const openrouter: LlmConfig = {
+      ...customStreamingCfg,
+      customEndpoint: "https://openrouter.ai/api/v1",
+      reasoningDisable: "chat_template_kwargs",
+    }
+    mockHttpFetch.mockImplementation(async () => new Response(JSON.stringify({
+      error: { message: "Unrecognized request argument: chat_template_kwargs" },
+    }), { status: 400 }))
+
+    const onError = vi.fn()
+
+    await streamChat(
+      openrouter,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone: vi.fn(), onError },
+      undefined,
+      { reasoning: { mode: "off" }, max_tokens: 4_096 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(1)
+    expect(onError).toHaveBeenCalledTimes(1)
+  })
+
+  it("matches the field the chosen method actually sends", async () => {
+    // `thinking_disabled` sends `thinking`, which a fixed keyword list missed.
+    const config: LlmConfig = { ...customStreamingCfg, reasoningDisable: "thinking_disabled" }
+    mockHttpFetch
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: "Unrecognized request argument: thinking" },
+      }), { status: 400 }))
+      .mockResolvedValueOnce(sseResponse(openAiSseToken("ok")))
+
+    const onToken = vi.fn()
+
+    await streamChat(
+      config,
+      [{ role: "user", content: "hi" }],
+      { onToken, onDone: vi.fn(), onError: vi.fn() },
+      undefined,
+      { reasoning: { mode: "off" }, max_tokens: 4_096 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(2)
+    expect(onToken).toHaveBeenCalledWith("ok")
+  })
+
+  it("does not retry a fuzzy rejection that names no field", async () => {
+    const config: LlmConfig = { ...customStreamingCfg, reasoningDisable: "enable_thinking" }
+    mockHttpFetch.mockImplementation(async () => new Response(JSON.stringify({
+      error: { message: "invalid request body" },
+    }), { status: 400 }))
+
+    const onError = vi.fn()
+
+    await streamChat(
+      config,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone: vi.fn(), onError },
+      undefined,
+      { reasoning: { mode: "off" }, max_tokens: 4_096 },
+    )
+
+    // Retrying blindly would double every unrelated 400; report instead.
+    expect(mockHttpFetch).toHaveBeenCalledTimes(1)
+    expect(onError).toHaveBeenCalledTimes(1)
+  })
+
+  it("reports both errors and no notice when the downgraded request fails", async () => {
+    const config: LlmConfig = { ...customStreamingCfg, reasoningDisable: "chat_template_kwargs" }
+    mockHttpFetch
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: "Unrecognized request argument: chat_template_kwargs" },
+      }), { status: 400 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: "still broken" },
+      }), { status: 400 }))
+
+    const onNotice = vi.fn()
+    const onError = vi.fn()
+
+    await streamChat(
+      config,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone: vi.fn(), onError, onNotice },
+      undefined,
+      { reasoning: { mode: "off" }, max_tokens: 4_096 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(2)
+    // The downgrade never happened, so it must not be reported as one.
+    expect(onNotice).not.toHaveBeenCalled()
+    const message = String(onError.mock.calls[0][0].message)
+    expect(message).toContain("chat_template_kwargs")
+    expect(message).toContain("still broken")
+  })
+
+  it("still cleans up and retries when the notice handler throws", async () => {
+    vi.useFakeTimers()
+    try {
+      const config: LlmConfig = { ...customStreamingCfg, reasoningDisable: "chat_template_kwargs" }
+      mockHttpFetch
+        .mockResolvedValueOnce(new Response(JSON.stringify({
+          error: { message: "Unrecognized request argument: chat_template_kwargs" },
+        }), { status: 400 }))
+        .mockResolvedValueOnce(sseResponse(openAiSseToken("ok")))
+
+      const controller = new AbortController()
+      const onToken = vi.fn()
+      const onDone = vi.fn()
+      const onNotice = vi.fn(() => {
+        throw new Error("observer blew up")
+      })
+
+      await streamChat(
+        config,
+        [{ role: "user", content: "hi" }],
+        { onToken, onDone, onError: vi.fn(), onNotice },
+        controller.signal,
+        { reasoning: { mode: "off" }, max_tokens: 4_096 },
+      )
+
+      expect(onToken).toHaveBeenCalledWith("ok")
+      expect(onDone).toHaveBeenCalledTimes(1)
+      // A throwing observer must not be able to leak the backstop timer.
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it("drops the rejected stop-thinking field and retries with thinking on", async () => {
     const configWithMethod: LlmConfig = {
       ...customStreamingCfg,

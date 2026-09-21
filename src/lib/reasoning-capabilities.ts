@@ -99,13 +99,9 @@ export function resolveReasoningCapabilities(config: LlmConfig): ReasoningCapabi
   }
   if (config.provider === "custom") {
     const endpoint = config.customEndpoint.toLowerCase()
-    if (isOpenRouterEndpoint(endpoint)) return capabilities(BUDGET_LEVELS)
-    if (/api\.deepseek\.(?:com|cn)(?:[:/]|$)/.test(endpoint)) {
-      return capabilities(DEEPSEEK_LEVELS)
-    }
-    if (/xiaomimimo\.com(?:[:/]|$)/.test(endpoint)) {
-      return capabilities(TOGGLE_LEVELS)
-    }
+    // Decide the wire first: a vendor-looking domain must not unlock a control
+    // the Anthropic wire cannot honour, and the code does ship Anthropic-wire
+    // presets on vendor domains (Xiaomi, Kimi, Moonshot).
     if ((config.apiMode ?? "chat_completions") === "anthropic_messages") {
       // On the Anthropic wire `off` and `auto` build byte-identical bodies —
       // thinking is only ever *enabled* explicitly — so an off control there
@@ -113,6 +109,15 @@ export function resolveReasoningCapabilities(config: LlmConfig): ReasoningCapabi
       // (it may enable thinking by default, and the Messages API has no
       // "disable" flag). Keep it auto-only, as before.
       return capabilities(AUTO_ONLY)
+    }
+    if (isOpenRouterEndpoint(endpoint)) return capabilities(BUDGET_LEVELS)
+    if (/api\.deepseek\.(?:com|cn)(?:[:/]|$)/.test(endpoint)) {
+      // Only DeepSeek V4 accepts the thinking parameter; for every other model
+      // on that domain the builder sends nothing, so no level is representable.
+      return capabilities(/deepseek[-_]?v4/i.test(config.model) ? DEEPSEEK_LEVELS : AUTO_ONLY)
+    }
+    if (/xiaomimimo\.com(?:[:/]|$)/.test(endpoint)) {
+      return capabilities(TOGGLE_LEVELS)
     }
     // "off" is only offerable once the user has said *how* to express it. With
     // no strategy we would send no field at all, so an off control would be a

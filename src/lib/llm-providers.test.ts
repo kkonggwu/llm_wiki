@@ -22,6 +22,7 @@ import {
   parseAnthropicResponse,
   parseGoogleResponse,
   parseOpenAiResponse,
+  resolveReasoningWirePlan,
   supportsImageInput,
   type ChatMessage,
   type ContentBlock,
@@ -816,6 +817,101 @@ describe("reasoning controls", () => {
     // Previously this inflated the caller's 512-token request to 8193.
     expect(body.thinking).toBeUndefined()
     expect(body.max_tokens).toBe(512)
+  })
+
+  it("enables thinking only from the allowance where thinking plus an answer fit", () => {
+    const cfg = mkConfig({ provider: "anthropic", model: "claude-sonnet-4-5-20250929" })
+    // 1025..2047 cannot hold 1024 thinking tokens *and* an answer, so thinking
+    // stays off rather than leaving the reply one or two tokens.
+    const cases: Array<[number, unknown]> = [
+      [1024, undefined],
+      [1025, undefined],
+      [2047, undefined],
+      [2048, { type: "enabled", budget_tokens: 1024 }],
+      [4096, { type: "enabled", budget_tokens: 3072 }],
+    ]
+    for (const [maxTokens, expected] of cases) {
+      const body = getProviderConfig(cfg).buildBody(
+        [{ role: "user", content: "hi" }],
+        { reasoning: { mode: "high" }, max_tokens: maxTokens },
+      ) as Record<string, unknown>
+
+      expect(body.thinking, `max_tokens=${maxTokens}`).toEqual(expected)
+      expect(body.max_tokens, `max_tokens=${maxTokens}`).toBe(maxTokens)
+    }
+  })
+
+  it("reports a native wire plan for endpoints that own their mapping", () => {
+    const cases: Array<[Partial<LlmConfig>, unknown]> = [
+      [
+        { model: "mimo-v2.5", customEndpoint: "https://token-plan-cn.xiaomimimo.com/v1" },
+        { source: "native", fields: ["thinking"] },
+      ],
+      [
+        { model: "vendor/reasoning", customEndpoint: "https://openrouter.ai/api/v1" },
+        { source: "native", fields: ["reasoning"] },
+      ],
+      [
+        { model: "deepseek-v4-flash", customEndpoint: "https://api.deepseek.com/v1" },
+        { source: "native", fields: ["thinking"] },
+      ],
+      [
+        // DeepSeek domain, but only V4 accepts the thinking parameter.
+        { model: "deepseek-chat", customEndpoint: "https://api.deepseek.com/v1" },
+        { source: "none", fields: [] },
+      ],
+      [
+        { model: "x", customEndpoint: "https://gateway.example/v1", reasoningDisable: "thinking_disabled" },
+        { source: "explicit", fields: ["thinking"] },
+      ],
+      [
+        { model: "x", customEndpoint: "https://gateway.example/v1" },
+        { source: "none", fields: [] },
+      ],
+    ]
+
+    for (const [over, expected] of cases) {
+      const cfg = mkConfig({ provider: "custom", apiMode: "chat_completions", ...over })
+      expect(resolveReasoningWirePlan(cfg, { reasoning: { mode: "off" } }), JSON.stringify(over))
+        .toEqual(expected)
+    }
+  })
+
+  it("never double-applies a leftover method on a native endpoint", () => {
+    const cfg = mkConfig({
+      provider: "custom",
+      model: "mimo-v2.5",
+      customEndpoint: "https://token-plan-cn.xiaomimimo.com/v1",
+      reasoningDisable: "chat_template_kwargs",
+    })
+    const body = getProviderConfig(cfg).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "off" } },
+    ) as Record<string, unknown>
+
+    expect(body.thinking).toEqual({ type: "disabled" })
+    expect(body.chat_template_kwargs).toBeUndefined()
+  })
+
+  it("reports no plan on the Anthropic wire or when reasoning is not off", () => {
+    const anthropicWire = mkConfig({
+      provider: "custom",
+      model: "mimo-v2.5",
+      customEndpoint: "https://token-plan-cn.xiaomimimo.com/anthropic",
+      apiMode: "anthropic_messages",
+      reasoningDisable: "enable_thinking",
+    })
+    expect(resolveReasoningWirePlan(anthropicWire, { reasoning: { mode: "off" } }))
+      .toEqual({ source: "none", fields: [] })
+
+    const auto = mkConfig({
+      provider: "custom",
+      model: "x",
+      customEndpoint: "https://gateway.example/v1",
+      reasoningDisable: "enable_thinking",
+    })
+    expect(resolveReasoningWirePlan(auto, { reasoning: { mode: "auto" } }))
+      .toEqual({ source: "none", fields: [] })
   })
 
   it("keeps cacheable system blocks when Anthropic extended thinking is enabled", () => {

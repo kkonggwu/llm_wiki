@@ -1000,6 +1000,7 @@ async function autoIngestImpl(
   let sourceContext = enrichedSourceContent
   let precomputedAnalysis = ""
   let longSourceCheckpointPath: string | undefined
+  const notices = createIngestNoticeSink()
 
   if (enrichedSourceContent.length > sourceBudget) {
     const longSourcePlan = await analyzeLongSourceInChunks(
@@ -1015,6 +1016,7 @@ async function autoIngestImpl(
       sourceBudget,
       activityId,
       signal,
+      notices,
     )
     if (longSourcePlan.chunked) {
       sourceContext = longSourcePlan.sourceContext
@@ -1034,12 +1036,6 @@ async function autoIngestImpl(
 
   let analysis = precomputedAnalysis
 
-  // Non-fatal transport notices raised while streamed answers are produced
-  // (for example a gateway rejecting the stop-thinking field, which silently
-  // re-enables thinking). Surfaced with the ingest warnings so the user sees the
-  // downgrade instead of only finding it in a log.
-  const streamNotices: string[] = []
-
   if (!analysis) {
     await streamChatWithReasoningRetry(
       llmConfig,
@@ -1049,7 +1045,7 @@ async function autoIngestImpl(
       ],
       {
         onToken: (token) => { analysis += token },
-        onNotice: (notice) => { streamNotices.push(notice) },
+        onNotice: (notice) => { notices.push(notice) },
         onDone: () => {},
         onError: (err) => {
           activity.updateItem(activityId, { status: "error", detail: `Analysis failed: ${err.message}` })
@@ -1069,7 +1065,7 @@ async function autoIngestImpl(
   // processNext's catch-block path (retry / mark failed) engages.
   const analysisActivity = useActivityStore.getState().items.find((i) => i.id === activityId)
   if (analysisActivity?.status === "error") {
-    throw new Error(analysisActivity.detail || "Analysis stream failed")
+    throw new Error(notices.appendedTo(analysisActivity.detail || "Analysis stream failed"))
   }
 
   // ── Step 2: Generation ────────────────────────────────────────
@@ -1114,7 +1110,7 @@ async function autoIngestImpl(
     ],
     {
       onToken: (token) => { generation += token },
-      onNotice: (notice) => { streamNotices.push(notice) },
+      onNotice: (notice) => { notices.push(notice) },
       onDone: () => {},
       onError: (err) => {
         activity.updateItem(activityId, { status: "error", detail: `Generation failed: ${err.message}` })
@@ -1130,7 +1126,7 @@ async function autoIngestImpl(
 
   const generationActivity = useActivityStore.getState().items.find((i) => i.id === activityId)
   if (generationActivity?.status === "error") {
-    throw new Error(generationActivity.detail || "Generation stream failed")
+    throw new Error(notices.appendedTo(generationActivity.detail || "Generation stream failed"))
   }
   throwIfIngestAborted(signal, activityId)
 
@@ -1160,6 +1156,7 @@ async function autoIngestImpl(
         ],
         {
           onToken: (token) => { reviewSuggestionOutput += token },
+        onNotice: (notice) => { notices.push(notice) },
           onDone: () => {},
           onError: (err) => {
             reviewStageHadError = true
@@ -1199,8 +1196,8 @@ async function autoIngestImpl(
   throwIfIngestAborted(signal, activityId)
   const writtenPaths = writeResult.writtenPaths
   const writeWarnings = writeResult.warnings
-  // Transport-level downgrades reported while streaming (see streamNotices).
-  writeWarnings.push(...streamNotices)
+  // Transport-level downgrades reported while streaming (see IngestNoticeSink).
+  writeWarnings.push(...notices.drain())
   const hardFailures = writeResult.hardFailures
   let unrecoveredTruncatedPaths = uniqueNormalizedPaths(
     writeResult.truncatedPaths.filter((path) =>
@@ -1239,6 +1236,7 @@ async function autoIngestImpl(
         ],
         {
           onToken: (token) => { repairOutput += token },
+        onNotice: (notice) => { notices.push(notice) },
           onDone: () => {},
           onError: (err) => {
             repairFailed = true
@@ -1307,6 +1305,9 @@ async function autoIngestImpl(
       )
     }
   }
+
+  // Notices raised by the repair stage land here, after the earlier drain.
+  writeWarnings.push(...notices.drain())
 
   try {
     if (await updateWikiIndexDeterministically(pp, writtenPaths)) {
@@ -2908,6 +2909,45 @@ function buildChunkAnalysisUserPrompt(
   ].filter(Boolean).join("\n")
 }
 
+/**
+ * Collects non-fatal transport notices for one ingest run — for example a
+ * gateway rejecting the stop-thinking field the user chose, which means this
+ * request silently continued with thinking enabled.
+ *
+ * One shared, de-duplicated sink serves every streamed stage (chunk analysis,
+ * analysis, generation, review, repair) so a downgrade is equally visible
+ * wherever it happens and a retried stage cannot repeat the same warning. It is
+ * drained into the ingest warnings on success, or appended to the thrown error
+ * when the run dies before those warnings exist.
+ */
+interface IngestNoticeSink {
+  push: (notice: string) => void
+  drain: () => string[]
+  appendedTo: (message: string) => string
+}
+
+function createIngestNoticeSink(): IngestNoticeSink {
+  const seen = new Set<string>()
+  let pending: string[] = []
+  const drain = () => {
+    const drained = pending
+    pending = []
+    return drained
+  }
+  return {
+    push: (notice) => {
+      if (seen.has(notice)) return
+      seen.add(notice)
+      pending.push(notice)
+    },
+    drain,
+    appendedTo: (message) => {
+      const drained = drain()
+      return drained.length === 0 ? message : `${message} (${drained.join("; ")})`
+    },
+  }
+}
+
 async function analyzeLongSourceInChunks(
   projectPath: string,
   llmConfig: LlmConfig,
@@ -2921,6 +2961,7 @@ async function analyzeLongSourceInChunks(
   sourceBudget: number,
   activityId: string,
   signal?: AbortSignal,
+  notices?: IngestNoticeSink,
 ): Promise<LongSourcePlan> {
   const targetChars = clampNumber(Math.floor(sourceBudget * 0.55), LONG_SOURCE_CHUNK_MIN, LONG_SOURCE_CHUNK_MAX)
   const overlapChars = clampNumber(Math.floor(targetChars * 0.08), 800, 3_000)
@@ -2978,6 +3019,7 @@ async function analyzeLongSourceInChunks(
       ],
       {
         onToken: (token) => { raw += token },
+        onNotice: (notice) => { notices?.push(notice) },
         onDone: () => {},
         onError: (err) => {
           hadError = true
@@ -2993,7 +3035,7 @@ async function analyzeLongSourceInChunks(
     )
 
     throwIfIngestAborted(signal, activityId)
-    if (hadError) throw new Error("Chunk analysis stream failed")
+    if (hadError) throw new Error(notices?.appendedTo("Chunk analysis stream failed") ?? "Chunk analysis stream failed")
 
     const chunkAnalysis = extractMarkedSection(raw, "Chunk Analysis") || raw.trim()
     const nextDigest = extractMarkedSection(raw, "Updated Global Digest")

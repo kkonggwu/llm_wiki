@@ -43,6 +43,39 @@ describe("reasoning capabilities", () => {
     expect(resolveReasoningCapabilities(cfg).modes).toEqual(["auto"])
   })
 
+  it("decides the wire before the vendor domain", () => {
+    // The app ships Anthropic-wire presets on vendor domains, so a Xiaomi or
+    // Moonshot domain must not unlock a control that wire cannot honour.
+    const xiaomiAnthropic = {
+      ...config("custom", "mimo-v2.5"),
+      customEndpoint: "https://token-plan-cn.xiaomimimo.com/anthropic",
+      apiMode: "anthropic_messages" as const,
+    }
+    expect(resolveReasoningCapabilities(xiaomiAnthropic).modes).toEqual(["auto"])
+
+    const moonshotAnthropic = {
+      ...config("custom", "kimi-k2.6"),
+      customEndpoint: "https://api.moonshot.cn/anthropic",
+      apiMode: "anthropic_messages" as const,
+    }
+    expect(resolveReasoningCapabilities(moonshotAnthropic).modes).toEqual(["auto"])
+  })
+
+  it("offers only what a DeepSeek domain can express", () => {
+    const nonV4 = {
+      ...config("custom", "deepseek-chat"),
+      customEndpoint: "https://api.deepseek.com/v1",
+    }
+    // Only V4 accepts the thinking parameter, so nothing else is representable.
+    expect(resolveReasoningCapabilities(nonV4).modes).toEqual(["auto"])
+
+    const v4 = {
+      ...config("custom", "deepseek-v4-flash"),
+      customEndpoint: "https://api.deepseek.com/v1",
+    }
+    expect(resolveReasoningCapabilities(v4).modes).toEqual(["auto", "off", "high", "max"])
+  })
+
   it("offers OpenRouter's documented reasoning controls only on its endpoint", () => {
     const cfg = {
       ...config("custom", "vendor/reasoning-model"),

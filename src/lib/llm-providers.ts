@@ -349,33 +349,77 @@ function effectiveReasoning(config: LlmConfig, overrides?: RequestOverrides): Re
 }
 
 /**
- * Which stop-thinking method this exact request should use, or `"none"` when it
- * should send nothing. Custom OpenAI-compatible endpoints only: the Anthropic
- * wire never carries these fields, and first-party providers have their own
- * mappings.
+ * How this exact request stops thinking, if at all.
  *
- * Exported because `llm-client`'s 400 fallback has to know whether a rejection
- * could have been caused by these fields — reading the same function means the
- * builder and the fallback can never disagree.
+ * The OpenAI-compatible builder has native mappings that return early
+ * (OpenRouter, DeepSeek V4, Xiaomi MiMo) and a generic path that applies the
+ * user's chosen method. Deciding this in one place is what keeps the builder,
+ * `llm-client`'s 400 fallback and the settings UI from disagreeing: earlier the
+ * fallback re-derived the decision and could claim a field had been sent when
+ * the builder had already returned, and Xiaomi ended up carrying both its
+ * native field *and* the explicit one.
  */
-export function reasoningDisableStrategyFor(
-  config: LlmConfig,
-  overrides?: RequestOverrides,
-): ReasoningDisableStrategy {
-  if (config.provider !== "custom") return "none"
-  if ((config.apiMode ?? "chat_completions") !== "chat_completions") return "none"
-  if (effectiveReasoning(config, overrides).mode !== "off") return "none"
-  return config.reasoningDisable ?? "none"
+export interface ReasoningWirePlan {
+  /**
+   * "native": the endpoint's own mapping handled it (the builder writes it
+   * before reaching the generic path). "explicit": the generic path writes
+   * `fields`. "none": nothing is written and no generic fallback applies.
+   */
+  source: "none" | "native" | "explicit"
+  /** Body fields the plan writes; empty for "none"/"native". */
+  fields: readonly string[]
+}
+
+const EXPLICIT_DISABLE_FIELDS: Record<Exclude<ReasoningDisableStrategy, "none">, string> = {
+  chat_template_kwargs: "chat_template_kwargs",
+  enable_thinking: "enable_thinking",
+  thinking_disabled: "thinking",
+  reasoning_effort_none: "reasoning_effort",
 }
 
 /**
- * Whether this request carries any stop-thinking field at all.
+ * True when this endpoint owns its reasoning mapping, so the generic method
+ * selector does not apply to it and the settings UI hides it.
  */
-export function appliesPortableReasoningDisable(
+export function usesNativeReasoningMapping(config: LlmConfig): boolean {
+  if (config.provider !== "custom") return false
+  return isOpenRouterEndpoint(config.customEndpoint)
+    || isDeepSeekEndpoint(config)
+    || isXiaomiMimoEndpoint(config)
+}
+
+export function resolveReasoningWirePlan(
   config: LlmConfig,
   overrides?: RequestOverrides,
-): boolean {
-  return reasoningDisableStrategyFor(config, overrides) !== "none"
+): ReasoningWirePlan {
+  if (effectiveReasoning(config, overrides).mode !== "off") {
+    return { source: "none", fields: [] }
+  }
+  if (config.provider !== "custom") {
+    // First-party providers map "off" through their own builders.
+    return { source: "native", fields: [] }
+  }
+  if ((config.apiMode ?? "chat_completions") !== "chat_completions") {
+    // The Anthropic wire has no disable field; "off" simply means "do not ask
+    // for thinking", which the builder already does.
+    return { source: "none", fields: [] }
+  }
+  if (isOpenRouterEndpoint(config.customEndpoint)) {
+    return { source: "native", fields: ["reasoning"] }
+  }
+  if (isDeepSeekEndpoint(config)) {
+    // Only V4 models accept the thinking parameter; otherwise nothing is sent.
+    return supportsDeepSeekThinkingParam(config)
+      ? { source: "native", fields: ["thinking"] }
+      : { source: "none", fields: [] }
+  }
+  if (isXiaomiMimoEndpoint(config)) {
+    return { source: "native", fields: ["thinking"] }
+  }
+
+  const strategy = config.reasoningDisable ?? "none"
+  if (strategy === "none") return { source: "none", fields: [] }
+  return { source: "explicit", fields: [EXPLICIT_DISABLE_FIELDS[strategy]] }
 }
 
 function isDeepSeekEndpoint(config: LlmConfig): boolean {
@@ -549,21 +593,23 @@ function buildOpenAiCompatibleBody(
     return body
   }
 
-  const disableStrategy = reasoningDisableStrategyFor(config, overrides)
-  if (disableStrategy !== "none") {
+  const disablePlan = resolveReasoningWirePlan(config, overrides)
+  if (disablePlan.source === "explicit") {
     // The user picked a documented "stop thinking" method for this gateway.
-    // Deliberately one field per method: mixing them means a gateway that
-    // accepts one and rejects another loses both on the 400 fallback, and it
-    // makes "which field did my endpoint dislike" impossible to answer.
-    // Gateways that reject the field still complete the request via
-    // llm-client's retry-without-reasoning fallback.
-    if (disableStrategy === "chat_template_kwargs") {
+    // Deliberately one field: mixing methods means a gateway that accepts one
+    // and rejects another loses both on the 400 fallback, and it makes "which
+    // field did my endpoint dislike" impossible to answer. Endpoints with their
+    // own mapping (OpenRouter / DeepSeek V4 / Xiaomi MiMo) never reach this
+    // branch — the plan reports them as "native", so a leftover saved method can
+    // never be applied on top of the native field.
+    const strategy = config.reasoningDisable ?? "none"
+    if (strategy === "chat_template_kwargs") {
       body.chat_template_kwargs = { enable_thinking: false }
-    } else if (disableStrategy === "enable_thinking") {
+    } else if (strategy === "enable_thinking") {
       body.enable_thinking = false
-    } else if (disableStrategy === "thinking_disabled") {
+    } else if (strategy === "thinking_disabled") {
       body.thinking = { type: "disabled" }
-    } else if (disableStrategy === "reasoning_effort_none") {
+    } else if (strategy === "reasoning_effort_none") {
       body.reasoning_effort = "none"
     }
   }
@@ -715,14 +761,14 @@ function buildAnthropicBodyWithReasoning(
   // allowance and the reply came back effectively empty — the same failure shape
   // as #743, and one that a single answer character would hide from the
   // reasoning-only diagnostic. Keep the caller's total allowance and clamp the
-  // thinking budget so the answer keeps real room instead. If the allowance
-  // cannot fit the API's minimum thinking budget plus an answer, thinking is
-  // left off rather than silently inflating the caller's max_tokens 16x.
-  if (total <= ANTHROPIC_MIN_THINKING_TOKENS) return body
+  // thinking budget so the answer keeps real room instead. Below the floor where
+  // both fit (1024 thinking + 1024 answer) thinking is left off rather than
+  // inflating the caller's max_tokens — 1025..2047 cannot satisfy either goal.
+  if (total < ANTHROPIC_MIN_THINKING_TOKENS + ANTHROPIC_ANSWER_RESERVE_TOKENS) return body
   const answerReserve = Math.min(ANTHROPIC_ANSWER_RESERVE_TOKENS, Math.floor(total / 2))
-  const budgetTokens = Math.max(
-    ANTHROPIC_MIN_THINKING_TOKENS,
-    Math.min(Math.max(ANTHROPIC_MIN_THINKING_TOKENS, budget), total - answerReserve),
+  const budgetTokens = Math.min(
+    Math.max(ANTHROPIC_MIN_THINKING_TOKENS, budget),
+    total - answerReserve,
   )
   body.thinking = { type: "enabled", budget_tokens: budgetTokens }
   delete body.temperature

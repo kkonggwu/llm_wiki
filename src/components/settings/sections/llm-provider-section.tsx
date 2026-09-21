@@ -15,6 +15,7 @@ import { testLlmConnection, testLlmFunction, type ProviderTestResult } from "@/l
 import { projectLlmProfile, resolveProjectLlmConfig } from "@/lib/llm-task-routing"
 import { saveProjectLlmOverride } from "@/lib/project-store"
 import { normalizeReasoningForProvider, resolveReasoningCapabilities } from "@/lib/reasoning-capabilities"
+import { usesNativeReasoningMapping } from "@/lib/llm-providers"
 
 const HTTP_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
 
@@ -783,7 +784,12 @@ function PresetRow({
             hint={t("settings.sections.llm.reasoning.ingestHint")}
           />
 
-          {preset.provider === "custom" && apiMode === "chat_completions" && (
+          {preset.provider === "custom"
+            && apiMode === "chat_completions"
+            // Endpoints with their own reasoning mapping (OpenRouter, DeepSeek
+            // V4, Xiaomi MiMo) ignore this choice, so offering it would imply a
+            // control we do not honour.
+            && !usesNativeReasoningMapping(resolvedConfig) && (
             <div className="space-y-2">
               <Label>{t("settings.sections.llm.reasoning.disableTitle")}</Label>
               <p className="text-xs text-muted-foreground">
