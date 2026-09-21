@@ -48,7 +48,7 @@ vi.mock("./tauri-fetch", async () => {
   return { ...actual, getHttpFetch: () => Promise.resolve(mockHttpFetch) }
 })
 
-import { autoIngest } from "./ingest"
+import { autoIngest, createIngestNoticeSink } from "./ingest"
 import { useWikiStore } from "@/stores/wiki-store"
 import { useReviewStore } from "@/stores/review-store"
 import { useActivityStore } from "@/stores/activity-store"
@@ -348,5 +348,29 @@ describe("ingest recovers from a reasoning-only analysis (#743)", () => {
 
     expect(String(thrown?.message)).toContain("commit runner unavailable")
     expect(String(thrown?.message)).toContain("retrying without chat_template_kwargs succeeded")
+  })
+})
+
+describe("ingest notice sink", () => {
+  it("de-duplicates notices and still reports them after a drain", () => {
+    const sink = createIngestNoticeSink()
+    sink.push("downgraded A")
+    // A retried stage can report the same downgrade twice.
+    sink.push("downgraded A")
+    sink.push("downgraded B")
+
+    expect(sink.all()).toEqual(["downgraded A", "downgraded B"])
+    // The ingest warning list takes each notice once.
+    expect(sink.drain()).toEqual(["downgraded A", "downgraded B"])
+    expect(sink.drain()).toEqual([])
+    // A failure *after* that drain must still report the whole history: the
+    // warnings assembled earlier are never written when the run dies.
+    expect(sink.appendedTo("boom")).toBe("boom (downgraded A; downgraded B)")
+  })
+
+  it("leaves a message untouched when nothing was downgraded", () => {
+    const sink = createIngestNoticeSink()
+    expect(sink.appendedTo("boom")).toBe("boom")
+    expect(sink.all()).toEqual([])
   })
 })

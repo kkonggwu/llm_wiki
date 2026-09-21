@@ -643,26 +643,117 @@ describe("streamChat — buffered streaming responses", () => {
     expect(onError).not.toHaveBeenCalled()
   })
 
-  it("keeps the request count bounded when every attempt fails", async () => {
+  it("keeps the request count bounded at five on the worst reachable path", async () => {
+    // The reachable maximum, not a guess: the temperature retry can itself end
+    // in a reasoning-only answer, which triggers the outer budget retry with the
+    // original overrides restored, and that attempt can walk the same two
+    // fallbacks again. 1 temperature 400 -> 2 without temperature, reasoning
+    // only -> 3 budget retry, temperature 400 again -> 4 without temperature,
+    // field 400 -> 5 without the field. A failed downgrade composes an error
+    // that is not retryable, so it stops there.
     const config: LlmConfig = { ...customStreamingCfg, reasoningDisable: "chat_template_kwargs" }
-    mockHttpFetch.mockImplementation(async () => new Response(JSON.stringify({
-      error: { message: "Unsupported parameter: temperature" },
-    }), { status: 400 }))
+    mockHttpFetch
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: "Unsupported parameter: temperature" },
+      }), { status: 400 }))
+      .mockResolvedValueOnce(sseResponse(openAiSseReasoning("t".repeat(300))))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: "Unsupported parameter: temperature" },
+      }), { status: 400 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: "Unrecognized request argument supplied: chat_template_kwargs" },
+      }), { status: 400 }))
+      .mockImplementation(async () => new Response(JSON.stringify({
+        error: { message: "still broken" },
+      }), { status: 400 }))
 
     const onError = vi.fn()
+    const onDone = vi.fn()
 
-    await streamChat(
+    await streamChatWithReasoningRetry(
       config,
       [{ role: "user", content: "hi" }],
-      { onToken: vi.fn(), onDone: vi.fn(), onError },
+      { onToken: vi.fn(), onDone, onError },
       undefined,
       { temperature: 0.1, reasoning: { mode: "off" }, max_tokens: 4_096 },
     )
 
-    // 1 temperature rejected -> 2 retried without it -> rejected -> 3 retried
-    // without the stop-thinking field; then it stops. Bounded, not a loop.
-    expect(mockHttpFetch.mock.calls.length).toBeLessThanOrEqual(4)
+    expect(mockHttpFetch).toHaveBeenCalledTimes(5)
+    const bodies = mockHttpFetch.mock.calls.map(
+      (call) => JSON.parse(String(call[1]?.body)) as Record<string, unknown>,
+    )
+    // 1: as configured. 2: temperature dropped, field kept.
+    expect(bodies[0]).toMatchObject({ temperature: 0.1, max_tokens: 4_096 })
+    expect(bodies[1].temperature).toBeUndefined()
+    expect(bodies[1].chat_template_kwargs).toEqual({ enable_thinking: false })
+    // 3: budget retry restores the original overrides with a larger budget.
+    expect(bodies[2]).toMatchObject({ temperature: 0.1, max_tokens: 16_384 })
+    // 4: temperature dropped again, field kept. 5: field dropped too.
+    expect(bodies[3].temperature).toBeUndefined()
+    expect(bodies[3].chat_template_kwargs).toEqual({ enable_thinking: false })
+    expect(bodies[4].temperature).toBeUndefined()
+    expect(bodies[4].chat_template_kwargs).toBeUndefined()
+
+    // Exactly one terminal callback, and it is the failure.
     expect(onError).toHaveBeenCalledTimes(1)
+    expect(onDone).not.toHaveBeenCalled()
+  })
+
+  it("settles a cancel through the wrapper exactly once, with no retry", async () => {
+    vi.useFakeTimers()
+    try {
+      mockHttpFetch.mockReset()
+      const { response, getReject, readCalled } = pendingStreamResponse()
+      mockHttpFetch.mockResolvedValue(response)
+
+      const onError = vi.fn()
+      const onDone = vi.fn()
+      const promise = streamChatWithReasoningRetry(
+        customStreamingCfg,
+        [{ role: "user", content: "hi" }],
+        { onToken: vi.fn(), onDone, onError },
+      )
+
+      await readCalled
+      getReject()("Request cancelled")
+      await promise
+
+      expect(onDone).toHaveBeenCalledTimes(1)
+      expect(onError).not.toHaveBeenCalled()
+      expect(mockHttpFetch).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("settles a backstop timeout through the wrapper exactly once", async () => {
+    vi.useFakeTimers()
+    try {
+      mockHttpFetch.mockReset()
+      const { response, getReject, readCalled } = pendingStreamResponse()
+      mockHttpFetch.mockResolvedValue(response)
+
+      const onError = vi.fn()
+      const onDone = vi.fn()
+      const promise = streamChatWithReasoningRetry(
+        customStreamingCfg,
+        [{ role: "user", content: "hi" }],
+        { onToken: vi.fn(), onDone, onError },
+      )
+
+      await readCalled
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1000)
+      getReject()("Request cancelled")
+      await promise
+
+      expect(onError).toHaveBeenCalledTimes(1)
+      expect(onError.mock.calls[0][0].message).toMatch(/timed out after 30 min/)
+      expect(onDone).not.toHaveBeenCalled()
+      // A timeout is not an empty answer, so it must not be retried.
+      expect(mockHttpFetch).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it("reports both errors and no notice when the downgraded request fails", async () => {
@@ -677,11 +768,12 @@ describe("streamChat — buffered streaming responses", () => {
 
     const onNotice = vi.fn()
     const onError = vi.fn()
+    const onDone = vi.fn()
 
     await streamChat(
       config,
       [{ role: "user", content: "hi" }],
-      { onToken: vi.fn(), onDone: vi.fn(), onError, onNotice },
+      { onToken: vi.fn(), onDone, onError, onNotice },
       undefined,
       { reasoning: { mode: "off" }, max_tokens: 4_096 },
     )
@@ -689,6 +781,8 @@ describe("streamChat — buffered streaming responses", () => {
     expect(mockHttpFetch).toHaveBeenCalledTimes(2)
     // The downgrade never happened, so it must not be reported as one.
     expect(onNotice).not.toHaveBeenCalled()
+    // ...and the failure is the single terminal callback.
+    expect(onDone).not.toHaveBeenCalled()
     const message = String(onError.mock.calls[0][0].message)
     expect(message).toContain("chat_template_kwargs")
     expect(message).toContain("still broken")

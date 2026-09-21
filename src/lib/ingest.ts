@@ -2946,7 +2946,7 @@ function buildChunkAnalysisUserPrompt(
  * drained into the ingest warnings on success, or appended to the thrown error
  * when the run dies before those warnings exist.
  */
-interface IngestNoticeSink {
+export interface IngestNoticeSink {
   push: (notice: string) => void
   /** Everything seen so far, de-duplicated (used by failure exits). */
   all: () => string[]
@@ -2958,7 +2958,7 @@ interface IngestNoticeSink {
   activityId?: string
 }
 
-function createIngestNoticeSink(): IngestNoticeSink {
+export function createIngestNoticeSink(): IngestNoticeSink {
   const seen = new Set<string>()
   const history: string[] = []
   let pending: string[] = []

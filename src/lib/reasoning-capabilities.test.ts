@@ -36,6 +36,33 @@ describe("reasoning capabilities", () => {
       .toEqual({ mode: "auto" })
   })
 
+  it("re-derives the modes when the endpoint or model changes", () => {
+    // The settings control must show what is actually in force after a switch,
+    // not what the previous endpoint allowed.
+    const generic = {
+      ...config("custom", "qwen3"),
+      customEndpoint: "https://gateway.example/v1",
+      reasoningDisable: "chat_template_kwargs" as const,
+    }
+    expect(resolveReasoningCapabilities(generic).modes).toEqual(["auto", "off"])
+
+    // A native endpoint keeps `off` but through its own mapping.
+    const openrouter = { ...generic, customEndpoint: "https://openrouter.ai/api/v1" }
+    expect(resolveReasoningCapabilities(openrouter).modes).toContain("off")
+
+    // A DeepSeek model that cannot express the parameter loses `off` entirely...
+    const nonV4 = { ...generic, customEndpoint: "https://api.deepseek.com/v1", model: "deepseek-chat" }
+    expect(resolveReasoningCapabilities(nonV4).modes).toEqual(["auto"])
+
+    // ...and a model that can gets the vendor levels back.
+    const v4 = { ...nonV4, model: "deepseek-v4-flash" }
+    expect(resolveReasoningCapabilities(v4).modes).toEqual(["auto", "off", "high", "max"])
+
+    // Moving to the Anthropic wire drops it again: there it cannot be honoured.
+    const anthropicWire = { ...generic, apiMode: "anthropic_messages" as const }
+    expect(resolveReasoningCapabilities(anthropicWire).modes).toEqual(["auto"])
+  })
+
   it("keeps Anthropic-wire custom gateways auto-only, where off is unrepresentable", () => {
     // The Anthropic builder emits byte-identical bodies for auto and off, so an
     // off control there would promise a guarantee the wire cannot make.
